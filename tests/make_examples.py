@@ -43,7 +43,7 @@ def case(case_id, sources, lattice, is_data=False):  # 创建已经明确科学�
 
 
 def manifest(cases, output):  # 建立可执行的完整任务清单。
-    return {"schema_version": 1, "confirmed": True, "output_dir": output, "cases": cases, "resources": {"workers": 2, "ovito_threads": 1, "chunk_size": 1, "benchmark_max_workers": 4, "reserve_memory_fraction": 0.25}}  # 明确资源和输出目录。
+    return {"schema_version": 1, "confirmed": True, "output_dir": output, "cases": cases, "resources": {"workers": "auto", "ovito_threads": 1, "chunk_size": 1, "benchmark_max_workers": 4, "reserve_memory_fraction": 0.25, "reserve_cpu_fraction": 0.1}}  # 使用资源自适应并发，不把某台机器的进程数写死到示例。
 
 
 def generate(output):  # 仅在新建或空目录中生成，避免覆盖已有研究数据。

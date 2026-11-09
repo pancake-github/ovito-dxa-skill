@@ -78,11 +78,24 @@ class IntegrationTests(unittest.TestCase):  # 针对可观察输出进行端到�
         self.invoke(RUNNER, "--config", path)  # 省略 --mode，直接执行真实 CLI。
         self.assertEqual({item.name for item in out.iterdir()}, {"run"})  # 不得隐式执行 baseline 或 benchmark。
         execution = json.loads((out / "run/execution.json").read_text(encoding="utf-8"))  # 读取真实采用的进程数及完成情况。
-        self.assertEqual((execution["workers"], execution["ovito_threads"]), (2, 1))  # 此机器资源充足时默认两个进程、每进程一个线程。
+        plan = execution["resource_plan"]  # 使用运行器记录的实际资源预算核对自动进程数。
+        self.assertEqual(plan["requested_workers"], "auto")  # 未指定资源时必须真正采用自动选择，而不是固定为两个进程。
+        self.assertEqual(execution["workers"], min(plan["limits"][name] for name in ("cpu", "tasks", "memory", "platform")))  # 受 CPU、任务块、内存和平台上限共同约束。
+        self.assertGreater(execution["workers"], 1)  # 此测试机器的资源足以并行处理四个独立帧。
+        self.assertEqual(execution["ovito_threads"], 1)  # 默认每个 OVITO 实例仅使用一个线程。
         self.assertEqual((execution["completed"], execution["failed"]), (4, 0))  # 三帧 BCC 和一帧 FCC 都已完成。
         rows = self.rows(out / "run/frames.csv")  # 从帧级输出验证进程号与结果状态。
         self.assertEqual(len(rows), 4)  # 每个输入帧恰有一条统计记录。
         self.assertTrue(all(row["status"] == "zero_dislocations" and int(row["worker_pid"]) > 0 for row in rows))  # 记录真实工作进程，零位错必须来自成功的晶体分析。
+        fcc_checkpoint = next((out / "run/checkpoints/fcc_snapshot").glob("*.json"))  # 只删除测试自有结果中的一个小案例检查点。
+        fcc_checkpoint.unlink()  # 模拟该帧尚未完成，而其他案例已经完成。
+        self.invoke(RUNNER, "--config", path, "--mode", "resume")  # 真实续算仅需要重新计算一个 FCC 帧。
+        resumed = json.loads((out / "run/execution.json").read_text(encoding="utf-8"))  # 获取续算时重新规划的资源。
+        self.assertEqual((resumed["workers"], resumed["resource_plan"]["job_count"]), (1, 1))  # 单个待处理帧只使用一个进程。
+        self.assertEqual(set(resumed["resource_plan"]["particle_estimates"]), {"fcc_snapshot"})  # 只有待处理案例参与本次内存估计。
+        self.invoke(RUNNER, "--config", path, "--mode", "resume")  # 已无待处理帧时再次恢复检查。
+        empty = json.loads((out / "run/execution.json").read_text(encoding="utf-8"))  # 读取仅核验检查点的资源计划。
+        self.assertEqual((empty["workers"], empty["resource_plan"]["job_count"]), (0, 0))  # 不为零任务启动空闲 worker。
 
     def test_default_single_frame_limits_worker_count(self):  # 单构型没有独立帧可供两个进程并行。
         payload = json.loads((self.folder / "static.json").read_text(encoding="utf-8"))  # 使用单帧 BCC 合成构型。
@@ -159,6 +172,7 @@ class IntegrationTests(unittest.TestCase):  # 针对可观察输出进行端到�
         self.assertEqual(report["context"]["sample_frame_count"], 4)  # 该示例共有四个代表帧，不应超过默认六帧限额。
         self.assertTrue(report["recommendation"])  # 合成数据应至少有一个合格候选。
         self.assertTrue(all(row["consistent"] for row in report["candidates"]))  # 合格计算必须与基线一致。
+        self.assertTrue(all(row["workers"] * row["ovito_threads"] <= report["context"]["cpu_budget"] for row in report["candidates"]))  # 可选比较的实际配置也不能绕过 CPU 预留预算。
         self.assertTrue((out / "benchmark/comparisons.csv").is_file())  # 保留可继续分析的数据表。
         page = (out / "benchmark/report.html").read_text(encoding="utf-8")  # 检查可视报告。
         self.assertIn("<svg", page)  # 报告包含原生性能图。

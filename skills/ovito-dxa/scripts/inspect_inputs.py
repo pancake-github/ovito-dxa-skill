@@ -60,7 +60,7 @@ def data_header_style(path):  # 仅读取最多 4 MiB 解压后头部，不依�
 
 def scan_text_dump(path):  # 流式核查单个 LAMMPS 文本 dump 的完整时间步头，不运行 DXA。
     started = time.perf_counter()  # 分别记录完整流扫描的耗时。
-    result = {"covered": False, "timestep_headers": None, "raw_timestep_headers": None, "errors": [], "duration_seconds": None, "reason": None}  # 初始化稳定返回结构。
+    result = {"covered": False, "timestep_headers": None, "raw_timestep_headers": None, "atom_count_headers": None, "raw_atom_count_headers": None, "max_particle_count": None, "errors": [], "duration_seconds": None, "reason": None}  # 初始化稳定返回结构，未知数量不写成零。
     try:  # 打开或扫描失败时返回机器可读错误。
         with contextlib.ExitStack() as stack:  # 保证普通和压缩文件句柄均会关闭。
             raw = stack.enter_context(Path(path).open("rb"))  # 以二进制方式读取源文件。
@@ -80,9 +80,13 @@ def scan_text_dump(path):  # 流式核查单个 LAMMPS 文本 dump 的完整时�
             else:  # 原始二进制或文本均先按原始字节读取。
                 stream = raw  # 不依据文件扩展名判定格式。
             first = True  # 跟踪第一个非空行以识别 YAML。
-            pending = False  # 标记是否正在等待 TIMESTEP 后面的整数。
+            pending = None  # 标记当前正在等待 timestep 或粒子数整数。
             headers = 0  # 计算完整的 TIMESTEP 和整数对。
             raw_headers = 0  # 计算所有字面 TIMESTEP 头，含末尾不完整头。
+            atom_count_headers = 0  # 计算值为非负整数的完整原子数头。
+            raw_atom_count_headers = 0  # 计算所有字面 NUMBER OF ATOMS 头。
+            max_particle_count = None  # 未读到合法数量时保持未知。
+            frame_atom_headers = None  # 尚未进入任何时间步时不假定帧已开始。
             line_number = 0  # 保存行号供定位。
             while True:  # 逐行扫描，不加载整个轨迹。
                 line = stream.readline(1048577)  # 限制单行的最大内存使用。
@@ -101,25 +105,46 @@ def scan_text_dump(path):  # 流式核查单个 LAMMPS 文本 dump 的完整时�
                     if stripped.startswith((b"---", b"keywords:", b"- keywords:")):  # YAML dump 不按文本 dump 标记扫描。
                         result["reason"] = "检测到 YAML；文本 TIMESTEP 头扫描未覆盖。"  # 保持格式边界明确。
                         return result  # 不将 YAML 误报为损坏。
-                if stripped == b"ITEM: TIMESTEP":  # LAMMPS 文本 dump 的精确头行。
-                    if pending:  # 前一个头后尚无合法步号。
-                        result["errors"].append(f"第 {line_number} 行前的 TIMESTEP 头缺少整数步号。")  # 记录结构缺失。
-                    raw_headers += 1  # 记录字面头行。
-                    pending = True  # 下一个行应是整数步号。
-                    continue  # 本行不能同时作为步号。
-                if pending:  # 刚刚遇到一个 TIMESTEP 头。
-                    try:  # 验证对应步号是整数。
-                        int(stripped)  # 只接受整数，而不是空行或其他头。
-                        headers += 1  # 完整时间步头计数加一。
-                    except ValueError:  # 头后不是合法整数。
-                        result["errors"].append(f"第 {line_number} 行不是合法的 TIMESTEP 整数。")  # 记录具体位置。
-                    pending = False  # 无论合法与否，结束该头检查。
-            if pending:  # 文件结束时仍在等待整数步号。
-                result["errors"].append("文件末尾 TIMESTEP 头缺少整数步号。")  # 记录末尾不完整。
+                if stripped in (b"ITEM: TIMESTEP", b"ITEM: NUMBER OF ATOMS"):  # 遇到受检查的两个头标记之一。
+                    if pending is not None:  # 前一头后缺少其所需整数。
+                        result["errors"].append(f"第 {line_number} 行前的 {pending} 头缺少整数值。")  # 记录被下一个头中断的错误。
+                    if stripped == b"ITEM: TIMESTEP":  # 每个时间步应恰有一个粒子数量头。
+                        if frame_atom_headers is not None and frame_atom_headers != 1:  # 上一帧数量头缺失或重复。
+                            result["errors"].append(f"第 {raw_headers} 帧包含 {frame_atom_headers} 个 NUMBER OF ATOMS 头，应为 1 个。")  # 防止不同帧重复和缺失相互抵消。
+                        raw_headers += 1  # 记录字面时间步头。
+                        frame_atom_headers = 0  # 从本帧开始重新计数。
+                        pending = "TIMESTEP"  # 后续一行必须是整数步号。
+                    else:  # 此头用于声明当前帧的粒子数量。
+                        raw_atom_count_headers += 1  # 记录字面原子数量头。
+                        if frame_atom_headers is None:  # 在第一个时间步头之前出现数量头。
+                            result["errors"].append(f"第 {line_number} 行的 NUMBER OF ATOMS 位于第一个 TIMESTEP 之前。")  # 明确不合法的结构。
+                        else:  # 已进入一个时间步。
+                            frame_atom_headers += 1  # 更新当前帧数量头个数。
+                        pending = "NUMBER OF ATOMS"  # 后续一行必须是非负整数。
+                    continue  # 当前头行不能同时作为数值。
+                if pending is not None:  # 刚刚遇到一个等待数值的头。
+                    try:  # 验证头后的值是合适的整数。
+                        value = int(stripped)  # 空行或非整数会进入异常分支。
+                        if pending == "NUMBER OF ATOMS" and value < 0:  # 粒子数不能为负。
+                            raise ValueError("原子数不能为负")  # 明确拒绝负数。
+                        if pending == "TIMESTEP":  # 时间步头检查完成。
+                            headers += 1  # 完整时间步头计数加一。
+                        else:  # 原子数量头检查完成。
+                            atom_count_headers += 1  # 完整的粒子数头计数加一。
+                            max_particle_count = value if max_particle_count is None else max(max_particle_count, value)  # 仅保存最大值，不存储逐帧数组。
+                    except ValueError:  # 头后不是合法的整数或粒子数为负。
+                        result["errors"].append(f"第 {line_number} 行不是合法的 {pending} 整数。")  # 记录具体位置和头的类别。
+                    pending = None  # 完成该头的数值检查。
+            if pending is not None:  # 文件结束时仍在等待头后的整数。
+                result["errors"].append(f"文件末尾 {pending} 头缺少整数值。")  # 记录末尾不完整。
+            if frame_atom_headers is not None and frame_atom_headers != 1:  # 检查最后一帧的原子数量头。
+                result["errors"].append(f"第 {raw_headers} 帧包含 {frame_atom_headers} 个 NUMBER OF ATOMS 头，应为 1 个。")  # 缺少或重复都显式报告。
+            if raw_atom_count_headers != raw_headers:  # 两类字面头数不一致表明轨迹结构异常。
+                result["errors"].append(f"TIMESTEP 头共 {raw_headers} 个，NUMBER OF ATOMS 头共 {raw_atom_count_headers} 个，数量不一致。")  # 明确报告总数差异。
             if raw_headers == 0:  # 没有文本 TIMESTEP 标记时无法确认格式。
                 result["reason"] = "未找到文本 TIMESTEP 头；可能是其他受支持格式，文本扫描未覆盖。"  # 不根据文件名强行判断。
                 return result  # 保留未覆盖状态。
-            result.update({"covered": True, "timestep_headers": headers, "raw_timestep_headers": raw_headers})  # 返回实际头数及完整性信息。
+            result.update({"covered": True, "timestep_headers": headers, "raw_timestep_headers": raw_headers, "atom_count_headers": atom_count_headers, "raw_atom_count_headers": raw_atom_count_headers, "max_particle_count": max_particle_count})  # 返回头数与最大粒子数。
     except Exception as exc:  # 捕获读取失败和压缩流损坏。
         result["errors"].append(describe_exception(exc))  # 保留异常类型和内容。
         result["reason"] = "文本头扫描读取失败，不能视作已完成。"  # 避免读取失败被解释为未损坏。

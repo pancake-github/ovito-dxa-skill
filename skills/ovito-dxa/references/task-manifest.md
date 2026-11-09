@@ -21,7 +21,11 @@
 - `density`：`{"mode":"none"}`，或 `{"mode":"cell","confirmed":true}`。cell 表示已确认统计线长与整个盒体体积适配；含真空、局部空间选区和复杂有效体积先走专用方法，不仅扣分母。
 - `output`：`{"level":"statistics"}` 或 `{"level":"geometry"}`。geometry 添加逐线记录及 CA 文件。
 
-资源配置：`workers` 为正整数（默认 2）；`ovito_threads` 为正整数或 `"auto"`（默认 1；auto 在单 worker 时采用 OVITO 内部默认线程，多 worker 时仍限制为每进程 1 线程）；`chunk_size` 默认 1；`max_pending_factor` 默认 2；`reserve_memory_fraction` 默认 0.25；`benchmark_max_workers` 默认 4；`benchmark_max_frames` 默认 6。默认直接以多进程配置运行，实际 worker 数受独立任务数、可用 CPU 及 Windows executor 上限限制；启动前内存估算超限会明确停止，不会自动缩减进程数后悄悄继续；独立单构型或仅有 1 个 CPU 时退为 1 个 worker，不属于额外基线。
+资源配置：`workers` 为 `"auto"`（默认）或正整数上限；`ovito_threads` 为正整数或 `"auto"`（默认 1）。显式 `ovito_threads="auto"` 在选择进程数时按每 worker 1 线程估算，实际仅有 1 个 worker 时使用 CPU 预算，多 worker 时每个 worker 仍为 1 线程。`chunk_size` 默认 1；`max_pending_factor` 默认 2；`reserve_cpu_fraction` 默认 0.1；`reserve_memory_fraction` 默认 0.25；`benchmark_max_workers` 默认 4；`benchmark_max_frames` 默认 6。
+
+默认 CPU 预算是 `max(1, floor(当前进程可用逻辑 CPU × 0.9))`。实际 worker 数按 CPU 预算／线程数、`ceil(待计算帧数 / chunk_size)`、可用内存预算／单 worker 估算、平台上限及显式 `workers` 正整数上限（若有）取最小值，各除法上限向下取整；Windows 平台最多 61 个，其他平台上限为可用 CPU。每 worker 估算为 `384 MiB + 4096 B × 估计最大粒子数`，采用待处理工况首帧和可覆盖文本 dump 所有原子数头的最大值。内存预算基于当前可用内存的 75%，该数已经反映父进程占用，不再次扣减；总 RSS 展示估算为 `父 RSS + worker 数 × 单 worker 估算`。估算不是实测峰值保证，未覆盖格式的粒子数可能被低估。内存不足 1 worker 时明确停止；其他限制可缩减指定的 worker 上限并记录原因。恢复时先筛去成功帧，再重新读取资源，只估算仍待处理的工况。
+
+默认直接处理所选帧，不进行额外串行 DXA 基线。独立单构型或资源限制可能导致实际仅 1 个 worker，这不是基线对照；可选 benchmark 才试跑代表帧。运行开始时打印资源选择，`execution.json.resource_plan` 记录请求和实际值、各上限、限制原因及估算覆盖范围。
 
 ## 输出与验收语义
 

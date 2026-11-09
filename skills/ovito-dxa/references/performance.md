@@ -9,7 +9,7 @@
 - 对同一帧统计结果集中汇总并输出，避免每条记录重复打开文件；若需要性能分析，再测量读取、DXA、数组计算、进程传输、压缩和写盘的耗时。只需要汇总时传小型标量；需要网络时由 worker 写独立文件，不把所有帧几何挤入主进程内存。
 - 保持数据精度、原子数量、DXA 搜索参数、线条平滑和粗化设置不变。任何改变这些设置的方案是另一分析定义，不能与等价实现的提速混为一谈。
 
-官方资料：[流水线与重复添加修饰器](https://www.ovito.org/manual/python/introduction/concepts/pipelines.html#processing-simulation-trajectories)、[性能指南](https://www.ovito.org/docs/current/python/introduction/scripting/performance.html)。
+官方资料：[流水线与重复添加修饰器](https://www.ovito.org/manual/python/introduction/concepts/pipelines.html#processing-simulation-trajectories)、[性能指南](https://www.ovito.org/manual/python/introduction/scripting/performance.html)。
 
 ## 根据数据选择并行
 
@@ -22,8 +22,17 @@
 
 使用 `spawn`，将 worker 定义在可导入的脚本或模块中，并保护主入口。不要跨进程传 `Pipeline`、`DataCollection` 或 OVITO 属性对象；仅传可序列化的普通值、配置、数组或文件路径。进程内存彼此独立，多个 worker 各自占用分析内存。
 
-默认直接执行正式多进程运行，起点为 2 个 worker、每个 worker `OVITO_THREAD_COUNT=1`，并在导入 `ovito` 之前设置线程数；进程数受 CPU、任务数和资源约束，也可以按已确认配置调整。仅按用户要求性能比较时，才与单进程配置在代表帧上比较。父解释器已经导入 OVITO 后再修改环境变量不证明设置生效；运行器应在新的解释器或正确初始化的 worker 中验证。
+默认直接执行正式运行，资源配置为 `workers="auto"`、`ovito_threads=1`，并在导入 `ovito` 之前设置线程数。进程数是资源估算得到的可行起点，不保证最快或保证实际内存峰值不会超过估计；不自动执行额外串行 DXA 基线。父解释器已经导入 OVITO 后再修改环境变量不证明设置生效；应在正确初始化的 worker 中验证。
 
+## 自动进程数的计算
+
+启动前读取当前进程可用逻辑 CPU 数与当时可用内存。默认 `reserve_cpu_fraction=0.1`，CPU 预算为 `max(1, floor(可用逻辑 CPU × 0.9))`；默认 `reserve_memory_fraction=0.25`，可用于新 worker 的内存预算为 `当前可用内存 × 0.75`。这里的可用内存已经反映父进程等当前占用，不再次扣除父进程 RSS。
+
+默认每个 worker 估算为 `384 MiB + 4096 B × 估计最大粒子数`。估计依据仍待处理工况的首帧元数据，及受覆盖文本 dump 全部 `NUMBER OF ATOMS` 头的最大值；它是启发式而非实测峰值或安全保证。二进制、YAML、无法完整扫描的压缩源等未覆盖部分无法证明最大粒子数，需检查报告中的覆盖情况。总 RSS 的展示估计为 `父进程 RSS + worker 数 × 每 worker 估算`，与可用内存预算不重复扣除父进程。
+
+实际 worker 数取以下上限的最小值：CPU 预算除以每 worker 线程数后向下取整、`ceil(待计算帧数 / chunk_size)`、内存预算除以每 worker 估算后向下取整、Windows 的 61 或其他平台的 CPU 上限，以及用户显式设置的正整数 `workers` 上限（若提供）。内存预算不足 1 个 worker 时明确停止；其他上限可以使实际进程数小于用户请求，并记录原因。`ovito_threads="auto"` 是可选设置：选择进程数时按每 worker 1 线程计算，实际只有 1 个 worker 时将线程数设为 CPU 预算；实际多个 worker 时每个 worker 仍为 1 线程。
+
+`resume` 先筛去已验证成功帧，再重新读取 CPU 和内存，只对仍需处理的工况进行粒子数估算。启动时输出选择结果，`execution.json.resource_plan` 记录请求与实际配置、各项上限、限制原因以及粒子数估算的覆盖情况。仅用户要求性能比较时，才在代表帧上运行单进程对照。
 Notebook 主流程为 `%%writefile DXA_Multiprocessing.py` 保存薄入口，再用 `%run DXA_Multiprocessing.py` 执行。两条魔法命令自身不创建并行；薄入口调用可导入的 `run_dxa.main(argv=None)`，Windows 的进程池 worker 定义在可导入的 `run_dxa.py`，不能把 Notebook 临时 `__main__` 中的函数提交给进程池。薄入口显式设置 `__spec__ = None`，支持 IPython 重复执行时的 spawn 元数据读取；还应检查已导入模块的实际路径，避免内核缓存了旧版本。[Python 进程池要求](https://docs.python.org/3/library/concurrent.futures.html#processpoolexecutor)
 
 ## 代表样本和资源约束
@@ -31,7 +40,7 @@ Notebook 主流程为 `%%writefile DXA_Multiprocessing.py` 保存薄入口，再
 仅当用户要求性能比较时，辅助运行器从每组所选范围选首、中、末去重候选帧，再按 `benchmark_max_frames` 全局均匀限额（默认 6 帧）；默认正式运行不进行这项对照。工况较多时可能有工况未抽到样本，不能声称这些工况经过验证；即使某组抽到三帧，也不能证明所有帧具有相同复杂度。后期缺陷增多、原子数改变或输入片段不同可能改变最佳配置。
 
 1. 仅按用户请求在相同代表帧上建立优化后的单进程串行基线，绝不作为全量运行的自动前置。若用户要求与旧脚本比较，另在隔离输出目录运行经过审查的旧脚本；只有实际运行的结果才能标为“原脚本”。
-2. 候选逐步增加进程数，受可用 CPU、帧数、平台上限和基线实测内存限制；保留系统余量。单构型只比较合理的内部线程设置。
+2. 候选逐步增加进程数，受 CPU 预留预算、实际帧块数、平台上限、用户显式进程上限及基线实测内存限制；单进程对照的内部线程也遵守 CPU 预算。单构型只比较合理的内部线程设置。
 3. 同一数据、参数、输出档次和存储位置比较完整耗时。导入、读取、计算、传输和结果落盘计入候选耗时；共同输入检查和 SHA256 成本单列。磁盘缓存状态、病毒扫描及系统负载也可能影响小样本结果。
 4. 记录进程树 RSS 的采样峰值，说明它是采样估计，可能遗漏瞬时峰值，并可能重复计算共享页；不是精确物理内存独占量。采样间隔和可用内存写入报告。
 5. 每个候选完成后比较科学结果；资源允许且通过一致性检查的候选才有资格推荐。全量运行仍须监测失败、缺帧和内存异常。

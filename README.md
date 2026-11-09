@@ -19,9 +19,9 @@
 
 在支持 `skill-installer` 的 Codex 中，可以直接请求：
 
-> 使用 skill-installer，从 https://github.com/pancake-github/ovito-dxa-skill/tree/v0.1.1/skills/ovito-dxa 安装 ovito-dxa 技能。
+> 使用 skill-installer，从 https://github.com/pancake-github/ovito-dxa-skill/tree/v0.1.2/skills/ovito-dxa 安装 ovito-dxa 技能。
 
-安装版本为 `v0.1.1`，安装目标是仓库中的 `skills/ovito-dxa` 目录，包含入口、参考资料及两个辅助脚本。安装后按宿主要求重新加载技能，再使用 `$ovito-dxa`。也可将该完整目录放入宿主的技能发现目录；不同机器不共享任何固定盘符。
+安装版本为 `v0.1.2`，安装目标是仓库中的 `skills/ovito-dxa` 目录，包含入口、参考资料及两个辅助脚本。安装后按宿主要求重新加载技能，再使用 `$ovito-dxa`。也可将该完整目录放入宿主的技能发现目录；不同机器不共享任何固定盘符。
 
 技能不会替使用者安装或升级科学计算环境。请使用已有且能导入 `ovito`、`numpy`、`psutil` 的 Python 3.10 或更新解释器。OVITO 的版本能力需先检查；当前验收目标为 Windows、Python 3.10.19、OVITO 3.14.1。Linux 采用兼容实现，但测试状态以验收记录为准。
 
@@ -30,7 +30,7 @@
 在已正常激活 OVITO 环境的终端中获取仓库。以下命令使用仓库自身的路径，不指向私有研究数据：
 
 ```powershell
-git clone --branch v0.1.1 --single-branch https://github.com/pancake-github/ovito-dxa-skill.git # 获取指定版本和公开合成示例生成器。
+git clone --branch v0.1.2 --single-branch https://github.com/pancake-github/ovito-dxa-skill.git # 获取指定版本和公开合成示例生成器。
 Set-Location ovito-dxa-skill # 将当前目录切换到本仓库根目录。
 python tests/make_examples.py --output examples/generated # 生成实际数据及与它们对应的完整清单。
 ```
@@ -49,13 +49,15 @@ python skills/ovito-dxa/scripts/inspect_inputs.py --paths examples/generated/bcc
 python skills/ovito-dxa/scripts/run_dxa.py --config examples/generated/task.json # 默认使用 run 模式及清单中的资源设置。
 ```
 
-默认资源起点为 2 个 worker、每个 worker 使用 1 个 OVITO 线程；实际数量受到可用 CPU 和任务数等限制。只有一个独立构型或只允许使用 1 个 CPU 时，退为 1 个 worker 是资源或任务限制，不是额外串行基线。用户确实需要比较性能时，才可选用 benchmark；它从每组所选范围选首、中、末去重候选帧，默认再全局均匀限额至 6 帧；未抽到的工况并未因此完成性能验证，不对全部帧执行串行基线。
+默认 `workers="auto"`、每个 worker 使用 1 个 OVITO 线程。运行器根据当前进程可用 CPU、剩余帧块、可用内存和平台上限自动选择进程数，预留约 10% 的可用逻辑 CPU 和 25% 的可用内存；用户指定正整数时，它作为额外上限。单构型或资源约束也可能只启动 1 个 worker，这不是额外串行基线；内存估计不足以启动 1 个 worker 时会明确停止。选择结果和限制原因会在启动时显示，并写入 `execution.json` 的 `resource_plan`。用户确实需要比较性能时，才可选用 benchmark；它从每组所选范围选首、中、末去重候选帧，默认再全局均匀限额至 6 帧；未抽到的工况并未因此完成性能验证，不对全部帧执行串行基线。
 
 ```powershell
 python skills/ovito-dxa/scripts/run_dxa.py --config examples/generated/task.json --mode benchmark # 仅按需比较代表帧，结果写入 benchmark 目录。
 ```
 
 benchmark 的 HTML 报告可在浏览器直接打开，无联网或绘图依赖；未执行或对照失败时不能声称提速。
+已有清单如果仍写有 `"workers": 2`，它会保留为显式并发上限；需要自动选择时应改为 `"workers": "auto"`。新生成的清单和运行器缺省值均已使用 auto。
+
 中断后使用相同清单和 `--mode resume`。输入、科学设置或软件版本发生变化时，不应复用旧结果；新建独立输出目录。运行器不会为了重跑自动删除已有结果。
 
 ## Notebook 入口
@@ -114,6 +116,7 @@ if __name__ == "__main__":  # 只在入口程序中启动计算，避免子进�
 ```
 
 `%%writefile` 用于写文件，`%run` 用于执行脚本；多进程来自运行器中的进程池，单靠 `%run` 不会创建并行。工作函数必须位于可导入的 `run_dxa.py` 模块，不能放在 Notebook 临时 `__main__` 中。实际环境仍应通过小规模运行检查导入、输出和结果状态。
+
 真实项目的清单应在预检与使用者确认后生成，不能直接把演示清单中的科学设置套到另一体系。完整字段和模式见 [任务清单](skills/ovito-dxa/references/task-manifest.md)。
 
 ## 阅读报告
@@ -136,6 +139,9 @@ python -m unittest discover -s tests -p "test_*.py" -v # 生成临时合成输�
 
 ## 方法来源与许可
 
-使用 [OVITO DXA 官方说明](https://docs.ovito.org/reference/pipelines/modifiers/dislocation_analysis.html)、[OVITO 性能指南](https://www.ovito.org/docs/current/python/introduction/scripting/performance.html)及 [Python 进程池文档](https://docs.python.org/3/library/concurrent.futures.html#processpoolexecutor)。问题背景参考[用户提供的 CSDN 文章](https://blog.csdn.net/wcget123/article/details/135202165)，本仓库独立实现代码，没有复制博客代码。
+[用户提供的 CSDN 文章](https://blog.csdn.net/wcget123/article/details/135202165)的改进版将 DXA 修饰器移到帧循环外、汇总结果后集中写出；该示例本身按帧串行执行。本仓库独立实现这些思路，并进一步通过 `spawn` 进程池为每个 worker 创建和复用私有流水线，使同一帧的统计与几何使用同一次计算结果。博客中的 BCC、14、9 等科学设置不自动用于其他体系，应根据具体材料和分析要求确认。
 
+资源自动配置使用启发式估算，不能保证内存峰值或最快速度：每个 worker 按 `384 MiB + 4096 B × 估计最大粒子数` 估算，依据待处理工况首帧元数据及可覆盖文本轨迹的全部原子数头。未覆盖的文件不能保证发现最大帧；具体覆盖情况记入 `resource_plan`。[性能方法](skills/ovito-dxa/references/performance.md)解释 CPU 和内存预算，以及断点续算的重新评估。
+
+参考 [OVITO DXA 官方说明](https://docs.ovito.org/reference/pipelines/modifiers/dislocation_analysis.html)、[OVITO 性能指南](https://www.ovito.org/manual/python/introduction/scripting/performance.html)及 [Python 进程池文档](https://docs.python.org/3/library/concurrent.futures.html#processpoolexecutor)。
 本仓库以 [MIT](LICENSE) 许可发布。OVITO 及其他依赖各自的许可仍适用；发表研究结果时应按照 OVITO 官方页面引用 DXA 算法论文。公共示例使用合成数据，私有研究数据不随仓库发布。

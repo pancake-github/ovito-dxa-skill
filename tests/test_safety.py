@@ -16,6 +16,86 @@ SPEC.loader.exec_module(DXA)  # 加载函数定义但不运行命令入口。
 
 
 class SafetyTests(unittest.TestCase):  # 覆盖独立审查发现的具体回归风险。
+    def test_benchmark_candidates_obey_same_resource_caps(self):  # 可选性能比较不能绕过正式运行的 CPU 预留和用户上限。
+        resources = {'workers': 'auto', 'benchmark_max_workers': 8, 'reserve_cpu_fraction': 0.1, 'chunk_size': 1}  # 使用四核机器和较宽探索上限。
+        candidates, budget = DXA._benchmark_candidates(resources, 20, 4, 61)  # 不启动 DXA，只构造实际将执行的候选。
+        self.assertEqual(budget, 3)  # 四个逻辑 CPU 保留余量后只能使用三个线程预算。
+        self.assertIn((3, 1), candidates)  # 非二次幂的合理上限也应被覆盖。
+        self.assertTrue(all(workers * threads <= budget for workers, threads in candidates))  # 单进程内部线程和多进程都不超预算。
+        restricted, _ = DXA._benchmark_candidates(dict(resources, workers=2), 20, 4, 61)  # 显式用户上限同样约束可选比较。
+        self.assertTrue(all(workers <= 2 for workers, threads in restricted))  # 不创建超过授权资源上限的候选。
+        chunked, _ = DXA._benchmark_candidates(dict(resources, chunk_size=20), 20, 4, 61)  # 一个任务块没有多进程空间。
+        self.assertTrue(all(workers == 1 for workers, threads in chunked))  # 不把同一块重复提交以制造并行。
+        self.assertEqual(DXA._benchmark_candidates(resources, 2, 1, 61)[0], [(1, 1)])  # 一核时去掉重复的相同配置，避免无效试跑。
+
+    def resource_defaults(self, **changes):  # 构造资源选择器接受的完整配置，不依赖真实机器状态。
+        resources = {"workers": "auto", "ovito_threads": 1, "chunk_size": 1, "reserve_cpu_fraction": 0.1, "reserve_memory_fraction": 0.25}  # 自动进程数及默认资源预留比例。
+        resources.update(changes)  # 单个场景仅覆盖需要验证的配置。
+        return resources  # 供纯函数资源测试使用。
+
+    def plan_resources(self, resources=None, **changes):  # 用可控数值调用真实资源规划器。
+        arguments = {"resources": resources or self.resource_defaults(), "job_count": 100, "cpu": 32, "available_memory": 100000, "parent_rss": 100, "per_worker_estimate": 1000, "platform_limit": 61}  # 默认场景由 CPU 决定进程数。
+        arguments.update(changes)  # 按测试意图改变指定约束。
+        return DXA._plan_resources(**arguments)  # 保留运行器的真实规划结果和限制原因。
+
+    def test_auto_resources_respect_cpu_budget_and_threads(self):  # 用户指定的每进程线程数应占用对应 CPU 预算。
+        plan = self.plan_resources(self.resource_defaults(ovito_threads=2), cpu=16)  # 16 个 CPU 预留 10%，得到 14 个可用线程。
+        self.assertEqual((plan["cpu_available"], plan["cpu_budget"]), (16, 14))  # 预算按 floor 规则计算。
+        self.assertEqual((plan["workers"], plan["ovito_threads"]), (7, 2))  # 14 个线程预算支持七个双线程进程。
+        self.assertEqual(plan["limits"]["cpu"], 7)  # 计划必须记录该 CPU 进程上限。
+        self.assertIn("cpu", plan["limiting_factors"])  # 使用者能够看到 CPU 是实际限制因素。
+
+    def test_memory_budget_limits_workers_without_double_counting_parent(self):  # 当前可用内存已经排除了父进程占用。
+        plan = self.plan_resources(available_memory=1024, parent_rss=8192, per_worker_estimate=256)  # 父进程 RSS 刻意设得很大以检验不重复扣除。
+        self.assertEqual(plan["memory_budget_bytes"], 768)  # 可用内存只需扣除 25% 系统预留。
+        self.assertEqual((plan["workers"], plan["limits"]["memory"]), (3, 3))  # 768 字节预算可容纳三个 256 字节 worker。
+        self.assertIn("memory", plan["limiting_factors"])  # 明确报告内存收窄了并行度。
+        self.assertEqual(plan["estimated_peak_bytes_before_start"], 8192 + 3 * 256)  # 进程树峰值估计仍应包含父进程 RSS。
+
+    def test_task_chunks_limit_workers(self):  # 分块执行时并发上限取任务块数而非原始帧数。
+        plan = self.plan_resources(self.resource_defaults(chunk_size=4), job_count=9)  # 9 帧按四帧一块形成三个任务块。
+        self.assertEqual((plan["job_count"], plan["task_chunks"]), (9, 3))  # 保留真实帧数及向上取整后的块数。
+        self.assertEqual((plan["workers"], plan["limits"]["tasks"]), (3, 3))  # 不创建超过任务块数量的进程。
+        self.assertIn("tasks", plan["limiting_factors"])  # 限制来源必须可审查。
+
+    def test_platform_and_explicit_worker_caps(self):  # 平台限制和用户指定的进程上限均不可突破。
+        platform = self.plan_resources(platform_limit=2)  # 模拟平台仅允许两个工作进程。
+        self.assertEqual((platform["workers"], platform["limits"]["platform"]), (2, 2))  # 平台约束生效。
+        self.assertIn("platform", platform["limiting_factors"])  # 必须说明平台是限制因素。
+        requested = self.plan_resources(self.resource_defaults(workers=4))  # 用户主动要求最多四个进程。
+        self.assertEqual((requested["workers"], requested["requested_workers"]), (4, 4))  # 实际数量不得超过用户上限。
+        self.assertIn("requested", requested["limiting_factors"])  # 用户约束应当记录在限制原因中。
+        reduced = self.plan_resources(self.resource_defaults(workers=10), job_count=2)  # 用户上限高于独立任务量。
+        self.assertEqual((reduced["workers"], reduced["requested_workers"]), (2, 10))  # 任务不足时收窄而不是强制启动十个进程。
+        self.assertIn("tasks", reduced["limiting_factors"])  # 保留资源不足的可解释原因。
+
+    def test_no_jobs_and_insufficient_memory(self):  # 零任务应是安全空操作，而不足一个 worker 的内存须报错。
+        empty = self.plan_resources(job_count=0, available_memory=0)  # 模拟所有帧已完成且没有可用内存。
+        self.assertEqual((empty["workers"], empty["job_count"], empty["task_chunks"]), (0, 0, 0))  # 不创建无意义的工作进程，也不报内存不足。
+        with self.assertRaises(RuntimeError):  # 确有任务时，不得绕过内存限制硬开一个进程。
+            self.plan_resources(available_memory=100, per_worker_estimate=1000)  # 一个进程的预估增量超出预算。
+
+    def test_cpu_oversubscription_and_zero_reserve(self):  # 显式线程数超过 CPU 预算必须拒绝。
+        with self.assertRaises(ValueError):  # 不能用单个超订阅进程绕过预算。
+            self.plan_resources(self.resource_defaults(ovito_threads=15), cpu=16)  # 预留后只有十四个 CPU 线程预算。
+        plan = self.plan_resources(self.resource_defaults(reserve_cpu_fraction=0), cpu=16)  # 用户允许全部 CPU 时不再额外预留。
+        self.assertEqual((plan["cpu_budget"], plan["workers"]), (16, 16))  # 真实预算与选取的进程数均为十六。
+
+    def test_auto_threads_depend_on_selected_worker_count(self):  # auto 线程在多进程与单进程下采用不同策略。
+        parallel = self.plan_resources(self.resource_defaults(ovito_threads="auto"), job_count=3)  # 多任务允许三个独立进程。
+        self.assertEqual((parallel["workers"], parallel["ovito_threads"]), (3, 1))  # 多进程时每个 OVITO 实例使用一个线程。
+        single = self.plan_resources(self.resource_defaults(ovito_threads="auto"), job_count=1)  # 单帧只能选择一个 worker。
+        self.assertEqual((single["workers"], single["ovito_threads"]), (1, 28))  # 单进程时可使用整个 CPU 预算。
+
+    def test_particle_estimates_use_complete_headers_or_disclose_fallback(self):  # 粒子数可能随轨迹变化，不能一律假设首帧最大。
+        cases = [{"id": "full", "sources": ["full_a", "full_b"]}, {"id": "partial", "sources": ["known", "unknown"]}, {"id": "static", "sources": ["data"]}]  # 覆盖完整文本、多源部分覆盖和单构型三种情况。
+        metadata = {"full": {"particle_count_first_frame": 100, "num_frames": 10}, "partial": {"particle_count_first_frame": 500, "num_frames": 5}, "static": {"particle_count_first_frame": 77, "num_frames": 1}}  # 用首帧值代表读取器可直接观测的数据。
+        scans = {"full_a": {"covered": True, "max_particle_count": 200}, "full_b": {"covered": True, "max_particle_count": 900}, "known": {"covered": True, "max_particle_count": 600}, "unknown": {"covered": False, "max_particle_count": None}}  # 测试完整扫描与未覆盖来源的区别。
+        estimates = DXA._particle_estimates(cases, metadata, scans)  # 获取每个案例独立的粒子数与覆盖范围。
+        self.assertEqual(estimates["full"], {"particle_count": 900, "scope": "all_text_dump_headers"})  # 完整文本扫描使用所有来源的最大值。
+        self.assertEqual(estimates["partial"], {"particle_count": 600, "scope": "first_frame_and_available_headers"})  # 部分来源未覆盖时，不宣称已知整个轨迹峰值。
+        self.assertEqual(estimates["static"], {"particle_count": 77, "scope": "single_frame"})  # 单构型使用读取到的首帧数量。
+
     def test_sample_jobs_preserves_first_middle_last_for_small_selection(self):  # 候选数在上限内时不额外删去代表帧。
         cases = [{"id": "long"}, {"id": "single"}]  # 分别覆盖长轨迹和单构型。
         frames = {"long": list(range(100)), "single": [7]}  # 100 帧应抽取三个代表帧，单帧仅出现一次。

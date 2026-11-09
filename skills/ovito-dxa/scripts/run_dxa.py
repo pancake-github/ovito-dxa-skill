@@ -142,17 +142,69 @@ def _normalize_config(path):  # 校验科学字段，不猜测材料结构、原
         if 'frames' not in case:  # 不满足要求时拒绝执行：该案例：缺少 frames。
             raise ValueError(f'{ident}: 缺少 frames')  # 明确报告当前错误，避免继续产生误导性结果。
     resource = config.setdefault('resources', {})  # 计算并保存变量 resource 的当前值。
-    for key, default in [('workers', 2), ('chunk_size', 1), ('max_pending_factor', 2), ('benchmark_max_workers', 4), ('benchmark_max_frames', 6)]:  # 默认从两个进程开始；可选对比最多抽取六帧，避免把全量串行作为前置。
+    resource.setdefault('workers', 'auto')  # 默认根据 CPU、内存预算和实际帧块数选择进程数，不固定为两个。
+    if resource['workers'] != 'auto' and (type(resource['workers']) is not int or resource['workers'] < 1):  # 显式正整数作为使用者指定的并发上限。
+        raise ValueError('workers 必须为 auto 或正整数')  # 拒绝布尔值、零、负数和无法解释的字符串。
+    for key, default in [('chunk_size', 1), ('max_pending_factor', 2), ('benchmark_max_workers', 4), ('benchmark_max_frames', 6)]:  # 可选对比最多抽取六帧，避免把全量串行作为前置。
         resource.setdefault(key, default)  # 调用 resource.setdefault 完成本行所示的处理。
         if type(resource[key]) is not int or resource[key] < 1:  # 不满足要求时拒绝执行：{key} 必须为正整数。
             raise ValueError(f'{key} 必须为正整数')  # 明确报告当前错误，避免继续产生误导性结果。
     resource.setdefault('ovito_threads', 1)  # 每进程默认一个 OVITO 线程，防止多进程叠加内部线程造成争抢。
     if resource['ovito_threads'] != 'auto' and (type(resource['ovito_threads']) is not int or resource['ovito_threads'] < 1):  # 不满足要求时拒绝执行：ovito_threads 必须为 auto 或正整数。
         raise ValueError('ovito_threads 必须为 auto 或正整数')  # 明确报告当前错误，避免继续产生误导性结果。
-    resource.setdefault('reserve_memory_fraction', 0.25)  # 调用 resource.setdefault 完成本行所示的处理。
-    if not 0 <= resource['reserve_memory_fraction'] < 1:  # 不满足要求时拒绝执行：reserve_memory_fraction 必须位于 [0,1)。
-        raise ValueError('reserve_memory_fraction 必须位于 [0,1)')  # 明确报告当前错误，避免继续产生误导性结果。
+    for key, default in [('reserve_memory_fraction', 0.25), ('reserve_cpu_fraction', 0.1)]:  # 为其他程序和主进程增长保留资源余量。
+        resource.setdefault(key, default)  # 使用者可按实际机器负载明确调整预留比例。
+        if type(resource[key]) not in (int, float) or not math.isfinite(resource[key]) or not 0 <= resource[key] < 1:  # 仅接受有限且位于半开区间的数值。
+            raise ValueError(f'{key} 必须为 [0,1) 内的有限数值')  # 不把非法比例静默当作默认值。
     return config  # 返回本函数计算的结果或检查结论。
+
+
+def _available_cpu():  # 优先读取当前进程可用的逻辑 CPU，避免把受限环境的全机核数当作预算。
+    import psutil  # 此处只查询资源，不导入 OVITO。
+    try:  # Windows 和部分 Unix 支持查询进程的 CPU 亲和性。
+        return max(1, len(psutil.Process().cpu_affinity()))  # 仅使用系统允许当前进程运行的逻辑 CPU 数。
+    except (AttributeError, NotImplementedError, psutil.Error):  # 不支持亲和性时采用解释器提供的可用信息。
+        process_count = getattr(os, 'process_cpu_count', os.cpu_count)  # 新版 Python 优先提供进程级计数，旧版使用系统逻辑 CPU 数。
+        return max(1, process_count() or 1)  # 无法取得核数时只允许一个线程预算。
+
+
+def _plan_resources(resources, job_count, cpu, available_memory, parent_rss, per_worker_estimate, platform_limit):  # 纯资源规划，不执行 DXA，不增加单进程试跑。
+    cpu_budget = max(1, math.floor(cpu * (1 - resources.get('reserve_cpu_fraction', 0.1))))  # 按逻辑 CPU 数保留约一成余量，至少允许一个计算线程。
+    memory_budget = int(available_memory * (1 - resources.get('reserve_memory_fraction', 0.25)))  # available 已排除现有父进程内存，此预算仅分配给新增 worker。
+    chunks = math.ceil(job_count / resources.get('chunk_size', 1))  # 真正可同时提交的是帧块；一大块不能假装有许多并行任务。
+    requested = resources.get('workers', 'auto')  # auto 不另设固定上限；显式正整数作为用户给出的最大进程数。
+    configured_threads = resources.get('ovito_threads', 1)  # 默认每个 worker 一个 OVITO 线程，避免嵌套并行过度占用。
+    threads = 1 if configured_threads == 'auto' else configured_threads  # 先按单线程估算 auto 配置的进程空间。
+    limits = {'cpu': cpu_budget // threads, 'tasks': chunks, 'memory': memory_budget // per_worker_estimate, 'platform': platform_limit, 'requested': None if requested == 'auto' else requested}  # 分别保留各约束的进程上限，便于解释选择。
+    workers = min(value for value in limits.values() if value is not None) if job_count else 0  # 无待算任务时不启动任何 DXA worker。
+    if job_count and limits['cpu'] < 1:  # 显式线程数超过预算时不能通过强制一个进程绕过检查。
+        raise ValueError(f'每进程 {threads} 个线程超过 CPU 预算 {cpu_budget}；请调整 ovito_threads 或 reserve_cpu_fraction')  # 给出具体的资源冲突。
+    if job_count and limits['memory'] < 1:  # 连一个 worker 都容不下时明确停止，而不是继续触发换页或内存不足。
+        raise RuntimeError(f'可用内存预算 {memory_budget / 1048576:.1f} MiB 不足以容纳一个估计需 {per_worker_estimate / 1048576:.1f} MiB 的 worker')  # 报告启发式启动估算及其预算。
+    if configured_threads == 'auto' and workers == 1:  # 仅使用者选择内部自动线程且实际只有一个 worker 时，使用 CPU 线程预算。
+        threads = cpu_budget  # 显式设置整数线程数，仍尊重当前进程可用 CPU 和预留余量。
+    reasons = [key for key, value in limits.items() if value is not None and value == workers] if job_count else ['no_pending_frames']  # 记录决定实际进程数的约束，而不是只返回一个数字。
+    return {'requested_workers': requested, 'workers': workers, 'ovito_threads': threads, 'cpu_available': cpu, 'cpu_budget': cpu_budget, 'available_memory_bytes': available_memory, 'memory_budget_bytes': memory_budget, 'parent_rss_bytes': parent_rss, 'per_worker_estimate_bytes': per_worker_estimate, 'estimated_peak_bytes_before_start': parent_rss + workers * per_worker_estimate, 'job_count': job_count, 'task_chunks': chunks, 'limits': limits, 'limiting_factors': reasons}  # 将规划依据写入执行记录供复查。
+
+
+def _particle_estimates(cases, metadata, scans):  # 用已完成的文本扫描改进内存估算，不额外加载轨迹或执行 DXA。
+    estimates = {}  # 每个案例单独记录粒子数依据，以便续算只考虑仍待处理案例。
+    for case in cases:  # 遍历已确认的案例和实际读取元数据。
+        counts = [scans[source].get('max_particle_count') for source in case['sources'] if source in scans and scans[source]['covered']]  # 已完整扫描的文本头提供最大粒子数。
+        known = [count for count in counts if count is not None]  # 无法取得的粒子数不虚构为零。
+        first = metadata[case['id']]['particle_count_first_frame']  # 其他格式至少保留读取器已读取的首帧粒子数。
+        scope = 'all_text_dump_headers' if len(known) == len(case['sources']) else ('single_frame' if metadata[case['id']]['num_frames'] == 1 else 'first_frame_and_available_headers')  # 明确是否覆盖完整轨迹，而非声称必然知道峰值规模。
+        estimates[case['id']] = {'particle_count': max([first, *known]), 'scope': scope}  # 使用已有证据中最大的粒子数作为启动估算输入。
+    return estimates  # 这是粒子数依据，不是 DXA 内存峰值的实测保证。
+
+
+def _benchmark_candidates(resources, job_count, cpu, platform_limit):  # 可选试跑同样遵守 CPU 预留、任务块和用户进程上限。
+    cpu_budget = max(1, math.floor(cpu * (1 - resources.get('reserve_cpu_fraction', 0.1))))  # 对照线程也不得绕过预留预算。
+    requested = resources.get('workers', 'auto')  # 显式并发上限同样约束可选性能探索。
+    maximum = min(resources.get('benchmark_max_workers', 4), math.ceil(job_count / resources.get('chunk_size', 1)), cpu_budget, platform_limit, cpu_budget if requested == 'auto' else requested)  # 取所有适用的进程上限。
+    counts = sorted({n for n in (2, 4, 8, 16, 32, 64, maximum) if 2 <= n <= maximum})  # 包含非二次幂的实际上限，避免预算三进程却只测两个。
+    candidates = list(dict.fromkeys([(1, cpu_budget), (1, 1)] + [(n, 1) for n in counts]))  # 对照先测试预算内内部线程；预算为一时去除重复配置。
+    return candidates, cpu_budget  # 内存准入仍在每项候选启动前根据估算和已观测峰值执行。
 
 
 def _init_worker(cases, output_dir, threads):  # 每个 spawn 子进程先设置环境变量，再延迟导入 OVITO。
@@ -450,7 +502,7 @@ def _report(out, rows, recommendation, preflight, context=None):  # 本地自包
             return '是' if value else '否'  # 返回本函数计算的结果或检查结论。
         return str(value)  # 返回本函数计算的结果或检查结论。
     table = ''.join('<tr>' + ''.join('<td>' + html.escape(display(r, k)) + '</td>' for k in fields) + '</tr>' for r in rows)  # 计算并保存变量 table 的当前值。
-    page = '<!doctype html><html lang="zh"><meta charset="utf-8"><title>DXA 基准</title><h1>DXA 基准</h1>' + f'<p>共同预检和 SHA-256 耗时 {preflight:.3f} 秒。基准为本运行器单进程、OVITO 自动线程；没有实测原用户脚本。峰值 RSS 为每 50 毫秒采样的进程树总和，可能低估真实峰值。加速仅代表本次抽样。</p><svg width="620" height="{max(40, len(measured) * 36 + 10)}" role="img" aria-label="候选运行时间">{bars}</svg><table border="1"><tr>' + ''.join('<th>' + html.escape(k) + '</th>' for k in labels) + '</tr>' + table + '</table><p>推荐：' + html.escape(str(recommendation)) + '</p></html>'  # 计算并保存变量 page 的当前值。
+    page = '<!doctype html><html lang="zh"><meta charset="utf-8"><title>DXA 基准</title><h1>DXA 基准</h1>' + f'<p>共同预检和 SHA-256 耗时 {preflight:.3f} 秒。基准为本运行器单进程、使用 CPU 预算内的 OVITO 线程；没有实测原用户脚本。峰值 RSS 为每 50 毫秒采样的进程树总和，可能低估真实峰值。加速仅代表本次抽样。</p><svg width="620" height="{max(40, len(measured) * 36 + 10)}" role="img" aria-label="候选运行时间">{bars}</svg><table border="1"><tr>' + ''.join('<th>' + html.escape(k) + '</th>' for k in labels) + '</tr>' + table + '</table><p>推荐：' + html.escape(str(recommendation)) + '</p></html>'  # 计算并保存变量 page 的当前值。
     details = f"案例数：{context.get('case_count', '—')}；代表帧数：{context.get('sample_frame_count', '—')}；可用 CPU：{context.get('available_cpu', '—')}；预检可用内存：{context.get('available_memory_bytes', 0) / 1048576:.1f} MiB；Python：{context.get('python_version', '—')}；OVITO：{context.get('ovito_version', '—')}"  # 汇总解释本次测试环境所需的最小信息。
     unsampled = context.get('unsampled_case_ids', [])  # 读取因全局样本限额而未参与计时的案例。
     if unsampled:  # 不能把未抽到的工况误表述为已经通过性能验证。
@@ -494,7 +546,7 @@ def main(argv=None):  # 默认直接正式分析；Notebook 薄入口可传入�
     elif out.exists():  # 不满足要求时拒绝执行：结果目录已经存在，拒绝覆盖：{out}。
         raise FileExistsError(f'结果目录已经存在，拒绝覆盖：{out}')  # 明确报告当前错误，避免继续产生误导性结果。
     import psutil  # 导入 psutil，用于查询可用资源和进程 RSS。
-    cpu = len(psutil.Process().cpu_affinity()) if hasattr(psutil.Process(), 'cpu_affinity') else (os.cpu_count() or 1)  # 计算并保存变量 cpu 的当前值。
+    cpu = _available_cpu()  # 使用当前进程可用的逻辑 CPU 数，不固定采用整机核数。
     available_memory = psutil.virtual_memory().available  # 计算并保存变量 available_memory 的当前值。
     preflight_start = time.perf_counter()  # 计算并保存变量 preflight_start 的当前值。
     source_paths = list(dict.fromkeys(source for case in cases for source in case['sources']))  # 计算并保存去重后的源文件路径。
@@ -539,17 +591,21 @@ def main(argv=None):  # 默认直接正式分析；Notebook 薄入口可传入�
     all_jobs = [(case['id'], frame) for case in cases for frame in frames[case['id']]]  # 建立所有案例和所选帧的一一对应任务。
     sample_jobs = _sample_jobs(cases, frames, resources['benchmark_max_frames']) if args.mode in ('baseline', 'benchmark') else []  # 正式运行不计算试跑样本，也不先执行单进程。
     parent_rss = psutil.Process().memory_info().rss  # 计算并保存主进程当前常驻内存。
-    per_worker_estimate = 384 * 1048576 + 4096 * max(m['particle_count_first_frame'] for m in metadata.values())  # 假定每进程 384 MiB 加每首帧原子 4096 字节；这只是启动估计。
+    particle_estimates = _particle_estimates(cases, metadata, scans)  # 复用已扫描的文本数量头，覆盖可变粒子数而不增加 DXA 试跑。
+    per_worker_estimate = 384 * 1048576 + 4096 * max(item['particle_count'] for item in particle_estimates.values())  # 启发式估算每个 worker 的基础开销与粒子数据，不承诺它是实际峰值上界。
+    available_memory = psutil.virtual_memory().available  # 在可能较长的哈希和预检之后重新读取可用内存。
     memory_limit = available_memory * (1 - resources['reserve_memory_fraction'])  # 从当前可用内存中保留用户要求的余量。
-    memory_note = '每进程预估 384 MiB 加首帧每原子 4096 字节；与已测进程树峰值取较保守者，仅用于启动筛选，不保证峰值'  # 计算并保存变量 memory_note 的当前值。
+    memory_note = '每进程启发式估算 384 MiB 加每原子 4096 字节；文本 dump 使用已扫描数量头最大值，其他来源采用首帧及可用头信息；不是 DXA 内存峰值保证，未自动进行计时或内存试跑'  # 说明默认自动选择的证据和能力边界。
     if args.mode == 'benchmark':  # 检查本行条件，满足时执行其下的分支。
         rows, reference = [], None  # 计算并保存性能报告中的候选配置记录。
-        max_workers = min(resources['benchmark_max_workers'], len(sample_jobs), cpu, 61 if os.name == 'nt' else cpu)  # 计算并保存变量 max_workers 的当前值。
-        candidates = [(1, 'auto'), (1, 1)] + [(n, 1) for n in (2, 4, 8, 16, 32, 64) if n <= max_workers]  # 计算并保存变量 candidates 的当前值。
+        sampled_cases = {cid for cid, frame in sample_jobs}  # 可选比较只考虑实际抽到的案例。
+        per_worker_estimate = 384 * 1048576 + 4096 * max(particle_estimates[cid]['particle_count'] for cid in sampled_cases)  # 未抽到的大案例不压低当前样本的资源配置。
+        cpu = _available_cpu()  # 候选构建前刷新当前可用逻辑 CPU 数。
+        candidates, benchmark_cpu_budget = _benchmark_candidates(resources, len(sample_jobs), cpu, 61 if os.name == 'nt' else cpu)  # 可选比较和正式运行遵守相同的 CPU 预留及用户上限。
         for workers, threads in candidates:  # 逐项遍历当前集合，分别执行缩进内的操作。
             measured = [r for r in rows if r.get('peak_rss_bytes') is not None]  # 计算并保存变量 measured 的当前值。
             observed = max([max(0, r['peak_rss_bytes'] - parent_rss) / r['workers'] for r in measured] or [0])  # 计算并保存变量 observed 的当前值。
-            estimated_rss = parent_rss + workers * max(per_worker_estimate, observed)  # 按较保守的理论或实测单进程开销，估算候选总内存。
+            estimated_rss = workers * max(per_worker_estimate, observed)  # available 已排除父进程占用，只对新增 worker 预算比较增量内存。
             if estimated_rss > memory_limit:  # 启动前排除预计超过预留内存限额的配置。
                 rows.append({'workers': workers, 'ovito_threads': threads, 'elapsed_seconds': None, 'peak_rss_bytes': None, 'speedup': None, 'consistent': False, 'resource_ok': False, 'recommended': False, 'note': '启动前内存估计超过限额，未运行'})  # 调用 rows.append 完成本行所示的处理。
                 continue  # 跳过当前项，继续处理下一项。
@@ -559,14 +615,14 @@ def main(argv=None):  # 默认直接正式分析；Notebook 薄入口可传入�
             if reference is None:  # 检查本行条件，满足时执行其下的分支。
                 reference = records  # 计算并保存单进程代表帧对照结果。
                 baseline = elapsed  # 计算并保存变量 baseline 的当前值。
-            memory_ok = peak <= available_memory * (1 - resources['reserve_memory_fraction'])  # 计算并保存变量 memory_ok 的当前值。
+            memory_ok = max(0, peak - parent_rss) <= memory_limit and workers * threads <= benchmark_cpu_budget  # 同时检查实测增量 RSS 和 CPU 预算，避免超预算候选被标为资源合格。
             warning = '所有代表帧均未识别到晶态原子' if records and all(r['status'] == 'no_crystalline_atoms' for r in records) else ''  # 计算并保存需要报告的科学边界提示。
             rows.append({'workers': workers, 'ovito_threads': threads, 'elapsed_seconds': elapsed, 'peak_rss_bytes': peak, 'speedup': baseline / elapsed, 'completed': sum(r['status'] in _OK for r in records), 'failed': sum(r['status'] not in _OK for r in records), 'consistent': _same_results(reference, records, cases), 'resource_ok': memory_ok, 'recommended': False, 'note': warning})  # 按成功帧、失败帧及科学一致性评价候选。
         valid = [r for r in rows if r['consistent'] and r['resource_ok']]  # 计算并保存结果一致且资源合格的候选。
         best = min(valid, key=lambda r: r['elapsed_seconds']) if valid else None  # 计算并保存通过条件的最快候选配置。
         if best is not None:  # 检查本行条件，满足时执行其下的分支。
             best['recommended'] = True  # 设置或传递此项参数，供当前操作使用。
-        context = {'case_count': len(cases), 'sample_frame_count': len(sample_jobs), 'sample_jobs': sample_jobs, 'unsampled_case_ids': [case['id'] for case in cases if case['id'] not in {cid for cid, frame in sample_jobs}], 'python_version': sys.version, 'ovito_version': next(iter(versions)), 'available_cpu': cpu, 'available_memory_bytes': available_memory}  # 明确记录实际抽样帧与未覆盖工况，不能把小样本结论扩展为全部数据最优。
+        context = {'case_count': len(cases), 'sample_frame_count': len(sample_jobs), 'sample_jobs': sample_jobs, 'unsampled_case_ids': [case['id'] for case in cases if case['id'] not in sampled_cases], 'python_version': sys.version, 'ovito_version': next(iter(versions)), 'available_cpu': cpu, 'cpu_budget': benchmark_cpu_budget, 'available_memory_bytes': available_memory}  # 明确记录抽样范围与资源预算，不能将小样本结论扩展为全部数据最优。
         _report(out, rows, {'workers': best['workers'], 'ovito_threads': best['ovito_threads']} if best else None, preflight, context)  # 输出无需外部依赖的完整报告。
         if best is None:  # 不满足要求时拒绝执行：没有结果一致且资源合格的候选配置。
             raise RuntimeError('没有结果一致且资源合格的候选配置')  # 明确报告当前错误，避免继续产生误导性结果。
@@ -592,13 +648,15 @@ def main(argv=None):  # 默认直接正式分析；Notebook 薄入口可传入�
             except (OSError, ValueError, KeyError, json.JSONDecodeError):  # 捕获指定错误并执行相应的恢复或报告。
                 missing.append((cid, frame))  # 损坏、缺失或失败的检查点重新加入待处理队列。
         jobs = missing  # 计算并保存待处理帧任务。
-    workers = 1 if args.mode == 'baseline' else min(resources['workers'], max(1, len(jobs)), cpu, 61 if os.name == 'nt' else cpu)  # 计算并保存并发工作进程数。
-    threads = 'auto' if args.mode == 'baseline' else (resources['ovito_threads'] if workers == 1 else (1 if resources['ovito_threads'] == 'auto' else resources['ovito_threads']))  # 计算并保存每个进程的 OVITO 线程数。
-    workers = workers if jobs else 0  # 全部检查点均可复用时，不启动 DXA worker，也不记录虚构的单进程运行。
-    if threads != 'auto' and workers * threads > cpu:  # 不满足要求时拒绝执行：进程数乘线程数超过可用 CPU。
-        raise ValueError('进程数乘线程数超过可用 CPU')  # 明确报告当前错误，避免继续产生误导性结果。
-    if jobs and parent_rss + workers * per_worker_estimate > memory_limit:  # 正式运行同样在启动前检查估计内存上限。
-        raise RuntimeError('启动前保守内存估计超过可用限额：' + memory_note)  # 明确报告当前错误，避免继续产生误导性结果。
+    pending_cases = {cid for cid, frame in jobs}  # 续算只对实际仍待计算的案例分配资源。
+    active_estimates = {cid: value for cid, value in particle_estimates.items() if cid in pending_cases}  # 已完成的大案例不再压低本次续算并发数。
+    per_worker_estimate = 384 * 1048576 + 4096 * max([item['particle_count'] for item in active_estimates.values()] or [0])  # 只使用当前任务的粒子规模，空任务不会启动 worker。
+    actual_resources = dict(resources, workers=1, ovito_threads='auto') if args.mode == 'baseline' else resources  # 仅显式 baseline 才做单进程对照，内部线程仍受 CPU 预留预算约束。
+    resource_plan = _plan_resources(actual_resources, len(jobs), _available_cpu(), psutil.virtual_memory().available, psutil.Process().memory_info().rss, per_worker_estimate, 61 if os.name == 'nt' else _available_cpu())  # 启动前重新读取资源，并按所有实际约束选取进程数。
+    resource_plan['particle_estimates'] = active_estimates  # 保存各待处理案例粒子规模及扫描覆盖情况。
+    workers, threads = resource_plan['workers'], resource_plan['ovito_threads']  # 执行已规划的进程与线程配置，不再采用固定默认数量。
+    if jobs:  # 有实际计算时展示选择依据；纯续算核验不报告虚构计算资源。
+        print(f"资源选择：请求进程数 {actual_resources['workers']}；CPU 可用 {resource_plan['cpu_available']} / 预算 {resource_plan['cpu_budget']}；待算 {len(jobs)} 帧 / {resource_plan['task_chunks']} 块；内存预算 {resource_plan['memory_budget_bytes'] / 1048576:.1f} MiB / 每进程估算 {per_worker_estimate / 1048576:.1f} MiB；限制因素 {', '.join(resource_plan['limiting_factors'])}。", flush=True)  # 让使用者在启动时核对自动并发选择。
     print(f'执行配置：{workers} 个工作进程，每进程 OVITO 线程数 {threads}；待计算 {len(jobs)} 帧，已复用 {len(retained)} 帧。' if jobs else f'本次没有待计算帧；复用了 {len(retained)} 帧，未启动 DXA 计算进程。', flush=True)  # 启动前展示实际配置，区分只核验检查点与真正计算。
     records, elapsed, peak = _run_jobs(cases, jobs, out, workers, threads, resources['chunk_size'], resources['max_pending_factor'], fingerprint) if jobs else ([], 0, 0)  # 计算并保存当前批次的帧结果。
     _verify_sources(source_stats, out, manifest)  # 调用 _verify_sources 完成本行所示的处理。
@@ -608,7 +666,7 @@ def main(argv=None):  # 默认直接正式分析；Notebook 薄入口可传入�
         _write_tables(out, records)  # 恢复运行合并旧的成功帧与本次处理结果。
     merge_seconds = time.perf_counter() - merge_started if retained else 0.0  # 不把恢复合并遗漏在耗时记录之外。
     warning = '所有已处理帧均未识别到晶态原子；请检查晶格、原子选区、边界和数据' if records and all(r['status'] == 'no_crystalline_atoms' for r in records) else ''  # 计算并保存需要报告的科学边界提示。
-    _atomic_json(out / 'execution.json', {'preflight_seconds': preflight, 'elapsed_seconds': elapsed, 'merge_seconds': merge_seconds, 'peak_rss_bytes_sampled': peak, 'workers': workers, 'ovito_threads': threads, 'memory_assumption': memory_note, 'estimated_peak_bytes_before_start': parent_rss + workers * per_worker_estimate, 'memory_limit_bytes': memory_limit, 'completed': sum(r['status'] in _OK for r in records), 'failed': sum(r['status'] not in _OK for r in records), 'warning': warning})  # 分别记录运行与恢复合并时间以及失败帧数量。
+    _atomic_json(out / 'execution.json', {'preflight_seconds': preflight, 'elapsed_seconds': elapsed, 'merge_seconds': merge_seconds, 'peak_rss_bytes_sampled': peak, 'workers': workers, 'ovito_threads': threads, 'memory_assumption': memory_note, 'estimated_peak_bytes_before_start': resource_plan['estimated_peak_bytes_before_start'], 'memory_limit_bytes': resource_plan['memory_budget_bytes'], 'resource_plan': resource_plan, 'completed': sum(r['status'] in _OK for r in records), 'failed': sum(r['status'] not in _OK for r in records), 'warning': warning})  # 保存实际配置、各项资源上限和限制因素，便于解释自动选择与续算。
     if warning:  # 检查本行条件，满足时执行其下的分支。
         print('警告：' + warning, file=sys.stderr)  # 调用 print 完成本行所示的处理。
     if any(r['status'] not in _OK for r in records):  # 不满足要求时拒绝执行：部分帧失败，请检查 {out / 。
