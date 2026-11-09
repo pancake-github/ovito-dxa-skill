@@ -1,0 +1,22 @@
+# 本机 Python 缓存与环境。
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# 合成输入按生成器再生，运行报告和私有研究数据不默认发布。
+examples/generated/
+examples/notebook_generated_*/
+artifacts/
+private/
+acceptance/private/
+test-output/
+*.tmp
+
+# 本机编辑器与系统文件。
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

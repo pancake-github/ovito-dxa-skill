@@ -1,0 +1,6 @@
+interface:
+  display_name: "OVITO DXA 优化助手"
+  short_description: "面向单组和多组原子模拟数据，指导可靠的位错提取、性能比较与结果验收"
+  default_prompt: "使用 $ovito-dxa 检查我的数据与分析要求，确认分组和科学设置后制定并验证 DXA 提速方案。"
+policy:
+  allow_implicit_invocation: true
