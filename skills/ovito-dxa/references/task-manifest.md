@@ -1,6 +1,6 @@
 # 任务清单与命令接口
 
-辅助脚本面向 Python 3.10+，使用可导入 OVITO、NumPy、psutil 的 Python 环境。Notebook 入口通过 `%%writefile DXA_Multiprocessing.py` 和 `%run DXA_Multiprocessing.py` 调用可导入的 `run_dxa.main(argv=None)`，Windows 的进程池 worker 定义在 `run_dxa.py`，不要放入 Notebook 临时 `__main__`。`inspect_inputs.py` 只读检查元数据，不执行 DXA，将报告打印到标准输出；`run_dxa.py --config FILE [--mode baseline|benchmark|run|resume]` 读取 JSON 清单，省略 mode 默认为 run。相对路径相对于清单所在目录解析。脚本不会安装或升级依赖。
+辅助脚本面向 Python 3.10+，使用可导入 OVITO、NumPy、psutil 的 Python 环境。Notebook 入口通过 `%%writefile DXA_Multiprocessing.py` 和 `%run DXA_Multiprocessing.py` 调用可导入的 `run_dxa.main(argv=None)`，Windows 的进程池 worker 定义在 `run_dxa.py`，不要放入 Notebook 临时 `__main__`。`inspect_inputs.py` 只读检查元数据，不执行 DXA，将报告打印到标准输出；`run_dxa.py --config FILE [--mode baseline|benchmark|scheduling|run|resume]` 读取 JSON 清单，省略 mode 默认为 run。相对路径相对于清单所在目录解析。脚本不会安装或升级依赖。
 
 ## 确认后的清单
 
@@ -21,19 +21,21 @@
 - `density`：`{"mode":"none"}`，或 `{"mode":"cell","confirmed":true}`。cell 表示已确认统计线长与整个盒体体积适配；含真空、局部空间选区和复杂有效体积先走专用方法，不仅扣分母。
 - `output`：`{"level":"statistics"}` 或 `{"level":"geometry"}`。geometry 添加逐线记录及 CA 文件。
 
-资源配置：`workers` 为 `"auto"`（默认）或正整数上限；`ovito_threads` 为正整数或 `"auto"`（默认 1）。显式 `ovito_threads="auto"` 在选择进程数时按每 worker 1 线程估算，实际仅有 1 个 worker 时使用 CPU 预算，多 worker 时每个 worker 仍为 1 线程。`chunk_size` 默认 1；`max_pending_factor` 默认 2；`reserve_cpu_fraction` 默认 0.1；`reserve_memory_fraction` 默认 0.25；`benchmark_max_workers` 默认 4；`benchmark_max_frames` 默认 6。
+资源配置：`scheduling` 为 `"case_sequential"`（默认）或 `"cross_case"`；`scheduling_evidence` 在明确选择跨工况时指向通过验证的报告 JSON。`workers` 为 `"auto"`（默认）或正整数上限；`ovito_threads` 为正整数或 `"auto"`（默认 1）。显式 `ovito_threads="auto"` 在选择进程数时按每 worker 1 线程估算，实际仅有 1 个 worker 时使用 CPU 预算，多 worker 时每个 worker 仍为 1 线程。`chunk_size` 默认 1；`max_pending_factor` 默认 2；`reserve_cpu_fraction` 默认 0.1；`reserve_memory_fraction` 默认 0.25；`benchmark_max_workers` 默认 4；`benchmark_max_frames` 默认 6。
 
-默认 CPU 预算是 `max(1, floor(当前进程可用逻辑 CPU × 0.9))`。实际 worker 数按 CPU 预算／线程数、`ceil(待计算帧数 / chunk_size)`、可用内存预算／单 worker 估算、平台上限及显式 `workers` 正整数上限（若有）取最小值，各除法上限向下取整；Windows 平台最多 61 个，其他平台上限为可用 CPU。每 worker 估算为 `384 MiB + 4096 B × 估计最大粒子数`，采用待处理工况首帧和可覆盖文本 dump 所有原子数头的最大值。内存预算基于当前可用内存的 75%，该数已经反映父进程占用，不再次扣减；总 RSS 展示估算为 `父 RSS + worker 数 × 单 worker 估算`。估算不是实测峰值保证，未覆盖格式的粒子数可能被低估。内存不足 1 worker 时明确停止；其他限制可缩减指定的 worker 上限并记录原因。恢复时先筛去成功帧，再重新读取资源，只估算仍待处理的工况。
+默认每个工况开始前重新读取该工况的 CPU、内存与待处理帧块，只估算该工况；一个工况的进程池结束后才进入下一工况。默认 CPU 预算是 `max(1, floor(当前进程可用逻辑 CPU × 0.9))`。实际 worker 数按 CPU 预算／线程数、`ceil(待计算帧数 / chunk_size)`、可用内存预算／单 worker 估算、平台上限及显式 `workers` 正整数上限（若有）取最小值，各除法上限向下取整；Windows 平台最多 61 个，其他平台上限为可用 CPU。每 worker 估算为 `384 MiB + 4096 B × 估计最大粒子数`，默认逐工况时采用当前待处理工况首帧和可覆盖文本 dump 所有原子数头的最大值。内存预算基于当前可用内存的 75%，该数已经反映父进程占用，不再次扣减；总 RSS 展示估算为 `父 RSS + worker 数 × 单 worker 估算`。估算不是实测峰值保证，未覆盖格式的粒子数可能被低估。内存不足 1 worker 时明确停止；其他限制可缩减指定的 worker 上限并记录原因。恢复时先筛去成功帧，再于每个工况启动前重新读取资源，只估算当前仍待处理的工况。
 
-默认直接处理所选帧，不进行额外串行 DXA 基线。独立单构型或资源限制可能导致实际仅 1 个 worker，这不是基线对照；可选 benchmark 才试跑代表帧。运行开始时打印资源选择，`execution.json.resource_plan` 记录请求和实际值、各上限、限制原因及估算覆盖范围。
+默认逐工况处理所选帧、工况内并行，不进行额外串行 DXA 基线。独立单构型或资源限制可能导致实际仅 1 个 worker，这不是基线对照；可选 benchmark 才试跑代表帧。每工况开始时打印资源选择；`execution.json.resource_plan.stages` 按执行顺序记录 case_ids、起止时间、请求和实际值、各上限、限制原因、估算覆盖和实测峰值。顶层 workers 表示各阶段最大同时进程数，不是阶段进程数之和；各阶段线程数不同时，顶层 ovito_threads 为 null，以阶段记录为准。全程内存采样包括最终统一汇总，全部完成的续算为 0 个阶段／0 个 DXA 进程。
+
+跨工况共同调度仅在用户明确选择 `resources.scheduling="cross_case"`、提供 `resources.scheduling_evidence` 报告路径，并且报告与当前输入科学指纹、资源策略及机器签名一致，并且报告内容摘要有效且通过收益判据时用于 run/resume；缺失、失配或未通过时明确停止。`--mode scheduling` 是按需的代表帧比较，不属于默认 run：两轮配对比较逐工况和跨工况，第二轮交换执行顺序。全部结果一致、资源合格，且跨工况较慢一轮仍严格快于逐工况较快一轮，才通过；不额外设置固定百分比或工况数门槛。比较结果仅覆盖所抽样本，不保证全轨迹收益。`--mode benchmark` 按需比较工况内进程配置，以样本单进程为参考，不自动尝试跨工况。
 
 ## 输出与验收语义
 
-- run/resume 共享 `output_dir/run`；baseline 写入 `output_dir/baseline`；benchmark 写入 `output_dir/benchmark`。新的运行不覆盖已有结果；resume 只接续可验证兼容的 run。
+- run/resume 共享 `output_dir/run`；baseline 写入 `output_dir/baseline`；benchmark 写入 `output_dir/benchmark`；按需调度比较写入 `output_dir/scheduling`，报告为 `report.json` 和 HTML。新的运行不覆盖已有结果；resume 只接续可验证兼容的 run。
 - 默认 run 执行所有已选择帧，不自动运行 baseline 或 benchmark；仅在用户要求对照时，baseline 和 benchmark 才抽取每组所选范围首、中、末的去重候选帧，并全局均匀限额至 `benchmark_max_frames`，未抽到的工况不表示经过验证；绝不自动对全量数据先做串行基线。
 - `frames.csv`：case_id、frame、timestep、time、total_line_length、cell_volume、density、density_m2、recognized_fraction、status、error、worker_pid 等；长度与体积保留原始单位。状态区分成功非零、成功零位错、无晶态原子以及失败；缺失数值留空，不用 0 冒充失败。worker_pid 是实际计算该帧的操作系统进程号，仅用于诊断，不是持续的科学身份，也不参与结果一致性比较。
 - `families.csv` 使用 case_id、frame、family、length 长表，不将 BCC 分类写死；geometry 的逐线标识只在该帧内有效。
-- 每帧 JSON 成功原子落盘后才可作为检查点；CA 必须先完整写入。记录源文件 SHA256、帧映射、分析参数、OVITO/Python 版本及运行配置。resume 拒绝来源、科学设置或版本变化，也拒绝缺失/损坏的几何结果冒充完成。
+- 同一工况内 worker 复用各自流水线，每个流水线只添加一次 DXA；同帧统计与几何共享一次 compute。任务有界提交，多工况统计集中汇总且不覆盖，CA 独立写出；每帧 JSON 成功原子落盘后才可作为检查点，CA 必须先完整写入。记录源文件 SHA256、帧映射、分析参数、OVITO/Python 版本及运行配置。resume 拒绝来源、科学设置或版本变化，也拒绝缺失/损坏的几何结果冒充完成。
 - 用户按需执行 benchmark 时，输出 JSON、CSV 及可直接打开的独立 HTML 报告，呈现完整候选耗时、峰值 RSS、相对于单进程基线的倍率、结果一致性和推荐配置。HTML 用原生 SVG/表格，无外部依赖，无 Matplotlib 或绘图插件依赖。总耗时包含导入、读取、计算、结果传输及落盘；共同预检/哈希开销单列。
 - 对照容差 rtol=1e-6、atol=1e-8；已知物理单位的长度、体积、密度分别换算为 Å、Å³、Å⁻² 后比较，无量纲比例单独比较。这样不会因使用 m 导致纳米尺度差异被绝对容差掩盖。unknown/reduced 保留原单位并记录限制。此转换仅用于验收，原始输出单位不变。不比较随机线 ID 或方向；超限不得自动放宽。仅代表帧通过数值与资源检查的候选可被推荐；全部无晶态原子不能成为合格推荐。最快的是本次样本结果，不是整条轨迹保证。
 

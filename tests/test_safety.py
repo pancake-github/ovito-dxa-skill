@@ -96,6 +96,59 @@ class SafetyTests(unittest.TestCase):  # 覆盖独立审查发现的具体回归
         self.assertEqual(estimates["partial"], {"particle_count": 600, "scope": "first_frame_and_available_headers"})  # 部分来源未覆盖时，不宣称已知整个轨迹峰值。
         self.assertEqual(estimates["static"], {"particle_count": 77, "scope": "single_frame"})  # 单构型使用读取到的首帧数量。
 
+    def scheduling_trials(self):  # 构造交叉执行顺序的两个配对样本，用于测试调度判据。
+        return [{"round": 1, "scheduling": "case_sequential", "elapsed_seconds": 5.0, "consistent": True, "resource_ok": True}, {"round": 1, "scheduling": "cross_case", "elapsed_seconds": 2.0, "consistent": True, "resource_ok": True}, {"round": 2, "scheduling": "cross_case", "elapsed_seconds": 3.0, "consistent": True, "resource_ok": True}, {"round": 2, "scheduling": "case_sequential", "elapsed_seconds": 4.0, "consistent": True, "resource_ok": True}]  # 混池较慢一轮仍快于逐工况较快一轮。
+
+    def test_scheduling_eligibility_requires_stable_scientific_gain(self):  # 仅单次加速或结果有差异都不足以启用混池。
+        trials = self.scheduling_trials()  # 首先建立两轮均有稳定收益的对照。
+        self.assertTrue(DXA._scheduling_eligible(trials))  # 两轮均一致且耗时区间分离时才允许跨工况。
+        overlap = copy.deepcopy(trials)  # 模拟性能区间刚好相等。
+        overlap[2]["elapsed_seconds"] = 4.0  # 严格快于而非小于等于才算收益。
+        self.assertFalse(DXA._scheduling_eligible(overlap))  # 区间相交或相等都不能自动切换。
+        for key in ("consistent", "resource_ok"):  # 分别检查科学一致性和资源约束。
+            failed = copy.deepcopy(trials)  # 单轮失败必须推翻整个比较。
+            failed[1][key] = False  # 只破坏一个候选结果。
+            self.assertFalse(DXA._scheduling_eligible(failed))  # 不能平均掉失败轮次。
+        self.assertFalse(DXA._scheduling_eligible(trials[:-1]))  # 缺少任一策略轮次时证据不完整。
+        duplicate = copy.deepcopy(trials)  # 复制真实样本结构但重复一个轮号。
+        duplicate[-1]["round"] = 1  # 第一和第二轮必须各有一条逐工况记录。
+        self.assertFalse(DXA._scheduling_eligible(duplicate))  # 重复轮号不能冒充双轮比较。
+        invalid = copy.deepcopy(trials)  # 检查无效的耗时数据。
+        invalid[1]["elapsed_seconds"] = float("nan")  # 非有限数值不可能证明收益。
+        self.assertFalse(DXA._scheduling_eligible(invalid))  # 不接受 NaN、零或负耗时。
+
+    def test_scheduling_evidence_must_match_and_pass_recomputed_criterion(self):  # 正式运行前必须同时核验数据来源、资源策略和双轮结果。
+        with tempfile.TemporaryDirectory(prefix="ovito-dxa-evidence-") as folder:  # 使用测试独占的临时证据文件。
+            path = Path(folder) / "report.json"  # 模拟已经生成的可读报告。
+            resources = self.resource_defaults(max_pending_factor=2, benchmark_max_frames=6, scheduling="cross_case", scheduling_evidence=str(path))  # 资源策略与当前运行显式保持一致。
+            with patch.object(DXA, "_machine_signature", return_value="test-machine"):  # 固定匿名机器签名，不依赖真实主机状态。
+                report = {"kind": "scheduling_comparison", "fingerprint": "science-v1", "resource_policy": DXA._resource_policy(resources), "machine_signature": "test-machine", "eligible_for_cross_case": True, "trials": self.scheduling_trials()}  # 构造完整且符合判据的结果。
+                def write_report(value):  # 测试不同报告内容时重新计算其真实内容摘要。
+                    value["_content_sha256"] = DXA._record_digest(value)  # 不包含摘要字段自身。
+                    path.write_text(json.dumps(value), encoding="utf-8")  # 保存机器可读的实际证据。
+                write_report(report)  # 先准备合法证据文件。
+                self.assertEqual(DXA._validate_scheduling_evidence(resources, "science-v1"), str(path.resolve()))  # 所有检查通过才返回证据路径。
+                with self.assertRaises(ValueError):  # 未提供证据不能直接选用跨工况。
+                    DXA._validate_scheduling_evidence({**resources, "scheduling_evidence": None}, "science-v1")  # 禁止仅凭工况数量切换。
+                with self.assertRaises(ValueError):  # 源数据或科学参数发生变化时拒绝旧结果。
+                    DXA._validate_scheduling_evidence(resources, "science-v2")  # 指纹不匹配。
+                with self.assertRaises(ValueError):  # 当前计算资源策略变化后不再复用性能结论。
+                    DXA._validate_scheduling_evidence({**resources, "chunk_size": 2}, "science-v1")  # 修改会影响实际调度的块大小。
+                tampered = copy.deepcopy(report)  # 原摘要不变而内容被修改。
+                tampered["machine_signature"] = "other-machine"  # 模拟证据文件损坏或篡改。
+                path.write_text(json.dumps(tampered), encoding="utf-8")  # 不重新计算摘要。
+                with self.assertRaises(ValueError):  # 内容摘要不符必须拒绝。
+                    DXA._validate_scheduling_evidence(resources, "science-v1")  # 不信任被改动的报告。
+                tampered["machine_signature"] = "other-machine"  # 保留不同机器的签名。
+                write_report(tampered)  # 即使摘要有效，也不能跨机器复用。
+                with self.assertRaises(ValueError):  # 机器身份不匹配。
+                    DXA._validate_scheduling_evidence(resources, "science-v1")  # 不忽略性能环境。
+                no_gain = copy.deepcopy(report)  # 将报告标志保留为真，但取消实测收益。
+                no_gain["trials"][2]["elapsed_seconds"] = 4.0  # 构造与逐工况耗时相交的样本区间。
+                write_report(no_gain)  # 重新计算摘要，排除只是损坏的可能。
+                with self.assertRaises(ValueError):  # 必须重新计算判据，不能只信推荐布尔值。
+                    DXA._validate_scheduling_evidence(resources, "science-v1")  # 拒绝没有稳定收益的跨工况运行。
+
     def test_sample_jobs_preserves_first_middle_last_for_small_selection(self):  # 候选数在上限内时不额外删去代表帧。
         cases = [{"id": "long"}, {"id": "single"}]  # 分别覆盖长轨迹和单构型。
         frames = {"long": list(range(100)), "single": [7]}  # 100 帧应抽取三个代表帧，单帧仅出现一次。

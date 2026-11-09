@@ -80,8 +80,15 @@ class IntegrationTests(unittest.TestCase):  # 针对可观察输出进行端到�
         execution = json.loads((out / "run/execution.json").read_text(encoding="utf-8"))  # 读取真实采用的进程数及完成情况。
         plan = execution["resource_plan"]  # 使用运行器记录的实际资源预算核对自动进程数。
         self.assertEqual(plan["requested_workers"], "auto")  # 未指定资源时必须真正采用自动选择，而不是固定为两个进程。
-        self.assertEqual(execution["workers"], min(plan["limits"][name] for name in ("cpu", "tasks", "memory", "platform")))  # 受 CPU、任务块、内存和平台上限共同约束。
-        self.assertGreater(execution["workers"], 1)  # 此测试机器的资源足以并行处理四个独立帧。
+        self.assertEqual(plan["scheduling"], "case_sequential")  # 默认先完成一个案例，再开始下一个案例。
+        stages = plan["stages"]  # 各阶段分别记录真实资源约束和执行时间。
+        self.assertEqual([stage["case_ids"] for stage in stages], [["bcc_trajectory"], ["fcc_snapshot"]])  # 案例顺序与确认清单一致，不能默认混池。
+        self.assertEqual([stage["job_count"] for stage in stages], [3, 1])  # 第一案例三个帧，第二案例一个帧。
+        self.assertEqual(execution["workers"], max(stage["workers"] for stage in stages))  # 顶层记录各阶段实际进程数的最大值。
+        self.assertEqual(stages[0]["workers"], min(stages[0]["limits"][name] for name in ("cpu", "tasks", "memory", "platform")))  # BCC 阶段根据其本身的资源约束选择进程数。
+        self.assertEqual(stages[0]["workers"], 3)  # 此测试机器资源充足时，三个 BCC 帧最多使用三个进程。
+        self.assertEqual(stages[1]["workers"], 1)  # FCC 案例只有一个帧，应收窄为单进程。
+        self.assertLessEqual(stages[0]["finished_unix"], stages[1]["started_unix"])  # 第二案例不得在第一案例结束前启动。
         self.assertEqual(execution["ovito_threads"], 1)  # 默认每个 OVITO 实例仅使用一个线程。
         self.assertEqual((execution["completed"], execution["failed"]), (4, 0))  # 三帧 BCC 和一帧 FCC 都已完成。
         rows = self.rows(out / "run/frames.csv")  # 从帧级输出验证进程号与结果状态。
@@ -93,9 +100,13 @@ class IntegrationTests(unittest.TestCase):  # 针对可观察输出进行端到�
         resumed = json.loads((out / "run/execution.json").read_text(encoding="utf-8"))  # 获取续算时重新规划的资源。
         self.assertEqual((resumed["workers"], resumed["resource_plan"]["job_count"]), (1, 1))  # 单个待处理帧只使用一个进程。
         self.assertEqual(set(resumed["resource_plan"]["particle_estimates"]), {"fcc_snapshot"})  # 只有待处理案例参与本次内存估计。
+        self.assertEqual([stage["case_ids"] for stage in resumed["resource_plan"]["stages"]], [["fcc_snapshot"]])  # 续算不应重新运行或创建已完成案例阶段。
+        self.assertEqual(len(self.rows(out / "run/frames.csv")), 4)  # 重新汇总时必须保留已完成案例的三帧。
         self.invoke(RUNNER, "--config", path, "--mode", "resume")  # 已无待处理帧时再次恢复检查。
         empty = json.loads((out / "run/execution.json").read_text(encoding="utf-8"))  # 读取仅核验检查点的资源计划。
         self.assertEqual((empty["workers"], empty["resource_plan"]["job_count"]), (0, 0))  # 不为零任务启动空闲 worker。
+        self.assertEqual(empty["resource_plan"]["stages"], [])  # 没有待处理帧时不能虚构案例执行阶段。
+        self.assertEqual(len(self.rows(out / "run/frames.csv")), 4)  # 零任务恢复不应覆盖或清空已有的完整汇总。
 
     def test_default_single_frame_limits_worker_count(self):  # 单构型没有独立帧可供两个进程并行。
         payload = json.loads((self.folder / "static.json").read_text(encoding="utf-8"))  # 使用单帧 BCC 合成构型。
@@ -105,6 +116,39 @@ class IntegrationTests(unittest.TestCase):  # 针对可观察输出进行端到�
         execution = json.loads((out / "run/execution.json").read_text(encoding="utf-8"))  # 获取实际缩减后的资源配置。
         self.assertEqual((execution["workers"], execution["completed"], execution["failed"]), (1, 1, 0))  # 仅一帧时自动收窄为一个进程并成功处理。
         self.assertEqual({item.name for item in out.iterdir()}, {"run"})  # 单构型也不能隐式触发额外试跑。
+
+    def test_cross_case_run_requires_matching_evidence(self):  # 默认逐工况，未经用户实测验证不能直接混池。
+        payload = copy.deepcopy(self.base)  # 从有效的双案例测试清单出发。
+        payload["resources"]["scheduling"] = "cross_case"  # 显式选择需要实测证据的调度模式。
+        payload["resources"].pop("scheduling_evidence", None)  # 不提供小样本比较报告。
+        path, out = self.config("cross_no_evidence", payload)  # 独立测试目录避免影响其他运行。
+        result = self.invoke(RUNNER, "--config", path, success=False)  # 缺证据必须明确失败。
+        self.assertIn("scheduling_evidence", result.stderr)  # 输出应指出缺少的证据字段。
+        self.assertFalse((out / "run").exists())  # 不得创建貌似已经启动的正式运行目录。
+
+    def test_optional_scheduling_evidence_controls_cross_case_run(self):  # 使用真实小样本报告决定是否允许跨工况运行。
+        payload = copy.deepcopy(self.base)  # 保留两种已确认的独立合成案例。
+        payload["resources"]["benchmark_max_frames"] = 2  # 两个案例各取一个样本，避免重型比较。
+        path, out = self.config("scheduling", payload)  # 比较报告与正式运行共享同一份科学清单。
+        self.invoke(RUNNER, "--config", path, "--mode", "scheduling")  # 仅显式请求时执行两策略双轮小样本对照。
+        report_path = out / "scheduling/report.json"  # 读取实际生成且带摘要的报告。
+        report = json.loads(report_path.read_text(encoding="utf-8"))  # 不篡改结果或伪造收益。
+        self.assertEqual(len(report["sample_jobs"]), 2)  # 总共只抽取两个代表帧。
+        self.assertEqual({job[0] for job in report["sample_jobs"]}, {"bcc_trajectory", "fcc_snapshot"})  # 两个案例均被采样。
+        self.assertEqual([(row["round"], row["scheduling"]) for row in report["trials"]], [(1, "case_sequential"), (1, "cross_case"), (2, "cross_case"), (2, "case_sequential")])  # 第二轮交换策略执行顺序。
+        self.assertTrue((out / "scheduling/report.html").is_file())  # 同时提供可视报告。
+        payload["resources"]["scheduling"] = "cross_case"  # 明确请求以比较报告作为正式运行的依据。
+        payload["resources"]["scheduling_evidence"] = str(report_path)  # 保留本次生成的原始报告路径。
+        payload["output_dir"] = str(out)  # 保持比较时使用的测试专属输出目录。
+        path.write_text(json.dumps(payload), encoding="utf-8")  # 不改动任何科学设置或源文件。
+        if report["eligible_for_cross_case"]:  # 只有实测两轮满足条件时才应允许跨工况。
+            self.invoke(RUNNER, "--config", path)  # 使用真实证据执行全部已确认帧。
+            execution = json.loads((out / "run/execution.json").read_text(encoding="utf-8"))  # 查看正式运行的实际调度。
+            self.assertEqual(execution["resource_plan"]["scheduling"], "cross_case")  # 确保确实采用获准的混池模式。
+            self.assertEqual((execution["completed"], execution["failed"]), (4, 0))  # 不遗漏未抽样的正式帧。
+        else:  # 结果不支持稳定收益时，必须拒绝而非伪造通过。
+            self.invoke(RUNNER, "--config", path, success=False)  # 验证没有收益的真实报告不能授权混池。
+            self.assertFalse((out / "run").exists())  # 不生成貌似成功的正式结果目录。
 
     def test_multicase_and_sequence_equivalence(self):  # 比较文件组织和并行方式不会改变结果。
         serial_payload = copy.deepcopy(self.base)  # 创建串行版本。

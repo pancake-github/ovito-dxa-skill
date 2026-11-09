@@ -17,23 +17,31 @@
 |---|---|
 | 一个静态构型 | 没有帧级并行空间；评估 OVITO 内部线程及输入输出。不要为了启动进程池重复计算同一构型。 |
 | 一组多帧轨迹 | 按独立帧或连续帧块分配任务；连续块可降低调度开销，但块过大可能导致负载不均。 |
-| 多组独立构型或轨迹 | 共享一个进程池，按工况或帧块调度；不同 case 的来源、晶格和设置保持独立。 |
+| 多组独立构型或轨迹 | 默认逐工况处理、在工况内并行；仅在用户明确选择并有合格调度报告支持时跨工况共同调度。各 case 的来源、晶格和设置保持独立。 |
 | 多个文件但关系不明 | 先确认分组和顺序，不能在调度器中自行拼接。 |
 
 使用 `spawn`，将 worker 定义在可导入的脚本或模块中，并保护主入口。不要跨进程传 `Pipeline`、`DataCollection` 或 OVITO 属性对象；仅传可序列化的普通值、配置、数组或文件路径。进程内存彼此独立，多个 worker 各自占用分析内存。
 
-默认直接执行正式运行，资源配置为 `workers="auto"`、`ovito_threads=1`，并在导入 `ovito` 之前设置线程数。进程数是资源估算得到的可行起点，不保证最快或保证实际内存峰值不会超过估计；不自动执行额外串行 DXA 基线。父解释器已经导入 OVITO 后再修改环境变量不证明设置生效；应在正确初始化的 worker 中验证。
+默认按 `scheduling="case_sequential"` 逐工况直接执行正式运行，工况内资源配置为 `workers="auto"`、`ovito_threads=1`，并在导入 `ovito` 之前设置线程数。进程数是资源估算得到的可行起点，不保证最快或保证实际内存峰值不会超过估计；不自动执行额外串行 DXA 基线。父解释器已经导入 OVITO 后再修改环境变量不证明设置生效；应在正确初始化的 worker 中验证。
 
 ## 自动进程数的计算
 
-启动前读取当前进程可用逻辑 CPU 数与当时可用内存。默认 `reserve_cpu_fraction=0.1`，CPU 预算为 `max(1, floor(可用逻辑 CPU × 0.9))`；默认 `reserve_memory_fraction=0.25`，可用于新 worker 的内存预算为 `当前可用内存 × 0.75`。这里的可用内存已经反映父进程等当前占用，不再次扣除父进程 RSS。
+默认逐工况时，每个工况开始前读取当前进程可用逻辑 CPU 数与当时可用内存，只估算本工况待处理帧块；前一工况进程池结束后才开始下一工况。默认 `reserve_cpu_fraction=0.1`，CPU 预算为 `max(1, floor(可用逻辑 CPU × 0.9))`；默认 `reserve_memory_fraction=0.25`，可用于新 worker 的内存预算为 `当前可用内存 × 0.75`。这里的可用内存已经反映父进程等当前占用，不再次扣除父进程 RSS。
 
 默认每个 worker 估算为 `384 MiB + 4096 B × 估计最大粒子数`。估计依据仍待处理工况的首帧元数据，及受覆盖文本 dump 全部 `NUMBER OF ATOMS` 头的最大值；它是启发式而非实测峰值或安全保证。二进制、YAML、无法完整扫描的压缩源等未覆盖部分无法证明最大粒子数，需检查报告中的覆盖情况。总 RSS 的展示估计为 `父进程 RSS + worker 数 × 每 worker 估算`，与可用内存预算不重复扣除父进程。
 
 实际 worker 数取以下上限的最小值：CPU 预算除以每 worker 线程数后向下取整、`ceil(待计算帧数 / chunk_size)`、内存预算除以每 worker 估算后向下取整、Windows 的 61 或其他平台的 CPU 上限，以及用户显式设置的正整数 `workers` 上限（若提供）。内存预算不足 1 个 worker 时明确停止；其他上限可以使实际进程数小于用户请求，并记录原因。`ovito_threads="auto"` 是可选设置：选择进程数时按每 worker 1 线程计算，实际只有 1 个 worker 时将线程数设为 CPU 预算；实际多个 worker 时每个 worker 仍为 1 线程。
 
-`resume` 先筛去已验证成功帧，再重新读取 CPU 和内存，只对仍需处理的工况进行粒子数估算。启动时输出选择结果，`execution.json.resource_plan` 记录请求与实际配置、各项上限、限制原因以及粒子数估算的覆盖情况。仅用户要求性能比较时，才在代表帧上运行单进程对照。
+`resume` 先筛去已验证成功帧，再逐工况重新读取 CPU 和内存，只对当前仍需处理的工况进行粒子数估算。启动时输出选择结果，`execution.json.resource_plan` 记录请求与实际配置、各项上限、限制原因以及粒子数估算的覆盖情况。仅用户要求性能比较时，才在代表帧上运行单进程对照。
 Notebook 主流程为 `%%writefile DXA_Multiprocessing.py` 保存薄入口，再用 `%run DXA_Multiprocessing.py` 执行。两条魔法命令自身不创建并行；薄入口调用可导入的 `run_dxa.main(argv=None)`，Windows 的进程池 worker 定义在可导入的 `run_dxa.py`，不能把 Notebook 临时 `__main__` 中的函数提交给进程池。薄入口显式设置 `__spec__ = None`，支持 IPython 重复执行时的 spawn 元数据读取；还应检查已导入模块的实际路径，避免内核缓存了旧版本。[Python 进程池要求](https://docs.python.org/3/library/concurrent.futures.html#processpoolexecutor)
+
+## 按需比较跨工况调度
+
+多个小工况可能值得比较，但工况数量或单构型的数量本身不决定进程数，也不触发自动切换。选样时检查它是否保留真实工况的并行度；把长轨迹缩成少数帧会让逐工况策略人为闲置，不能据此推断完整长轨迹也适合跨工况。若当前样本限额不足以代表负载，说明证据不足，保持默认策略；需增加试跑规模时先与使用者确认。`--mode scheduling` 是用户按需执行的调度比较，不是默认运行的前置步骤；只使用代表帧，执行两轮配对比较：一轮先逐工况后跨工况，另一轮交换顺序。此过程比较调度方式，不以单进程作为基线。
+
+全部代表帧结果一致且资源合格，并且跨工况两轮中的较慢耗时仍严格小于逐工况两轮中的较快耗时，才判为样本显示收益，即两组耗时区间不重叠。无需设定固定百分比或最少工况数。该判据不能保证全轨迹收益，未抽中的工况也没有经过比较。
+
+报告默认保存为 `output_dir/scheduling/report.json` 与同目录 HTML。只有用户明确选择 `resources.scheduling="cross_case"`，并在 `resources.scheduling_evidence` 指定当前报告，且 run/resume 验证输入科学指纹、资源策略和运行机器一致并通过收益判据，才进行跨工况共同调度；否则明确停止。普通 `benchmark` 仅对工况内不同进程数作按需比较，不会自动尝试跨工况。
 
 ## 代表样本和资源约束
 
@@ -63,4 +71,4 @@ HTML 报告使用原生 SVG 和表格，无联网资源或绘图依赖。至少�
 
 ## 方法来源
 
-本技能参考 OVITO/Python 官方文档及[用户提供的 CSDN 文章](https://blog.csdn.net/wcget123/article/details/135202165)中的问题背景。文章改进版将 DXA 添加移出帧循环并集中写出；它本身不是多进程版本。本技能进一步将流水线保持为每个 worker 私有并复用于分配的帧，同一帧的统计与几何共享一次计算结果。本仓库代码独立实现，没有复制博客代码。论文或报告中使用 DXA 时应按 [OVITO DXA 页面](https://docs.ovito.org/reference/pipelines/modifiers/dislocation_analysis.html)引用算法论文。
+本技能参考 OVITO/Python 官方文档及[用户提供的 CSDN 文章](https://blog.csdn.net/wcget123/article/details/135202165)中的问题背景。文章改进版将 DXA 添加移出帧循环并集中写出；它本身不是多进程版本。本技能进一步将流水线保持为每个 worker 私有并复用于分配的帧，同一帧的统计与几何共享一次计算结果；不采纳逐帧重新导入、一次性提交所有帧、保存全部大数组或固定层等特定科学定义。本仓库代码独立实现，没有复制博客代码。论文或报告中使用 DXA 时应按 [OVITO DXA 页面](https://docs.ovito.org/reference/pipelines/modifiers/dislocation_analysis.html)引用算法论文。

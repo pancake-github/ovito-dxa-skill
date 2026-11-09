@@ -11,6 +11,7 @@ import json  # 导入 json，用于读写清单、检查点和报告。
 import math  # 导入 math，用于检查有限数值并进行容差比较。
 import multiprocessing as mp  # 导入 multiprocessing，用于通过 spawn 建立独立工作进程。
 import os  # 导入 os，用于处理文件环境变量及原子替换。
+import platform  # 记录调度比较所用机器的匿名签名，避免跨机器套用耗时结论。
 from pathlib import Path  # 导入 pathlib，用于构造跨平台绝对路径。
 import re  # 导入 re，用于验证标识符及识别 data 文件头。
 import sys  # 导入 sys，用于访问解释器版本和标准错误。
@@ -142,6 +143,13 @@ def _normalize_config(path):  # 校验科学字段，不猜测材料结构、原
         if 'frames' not in case:  # 不满足要求时拒绝执行：该案例：缺少 frames。
             raise ValueError(f'{ident}: 缺少 frames')  # 明确报告当前错误，避免继续产生误导性结果。
     resource = config.setdefault('resources', {})  # 计算并保存变量 resource 的当前值。
+    resource.setdefault('scheduling', 'case_sequential')  # 默认依次处理工况，每个工况内部再按帧并行。
+    if resource['scheduling'] not in ('case_sequential', 'cross_case'):  # 两种策略均保持科学计算定义不变。
+        raise ValueError('scheduling 必须为 case_sequential 或 cross_case')  # 不猜测未支持的调度名称。
+    if 'scheduling_evidence' in resource:  # 仅显式选择跨工况时需要已有的小样本比较证据。
+        if not isinstance(resource['scheduling_evidence'], str) or not resource['scheduling_evidence']:  # 证据路径必须是实际非空路径。
+            raise ValueError('scheduling_evidence 必须为非空报告路径')  # 不接受布尔值或未填入的空路径。
+        resource['scheduling_evidence'] = str((path.parent / resource['scheduling_evidence']).resolve())  # 按清单位置解释相对路径。
     resource.setdefault('workers', 'auto')  # 默认根据 CPU、内存预算和实际帧块数选择进程数，不固定为两个。
     if resource['workers'] != 'auto' and (type(resource['workers']) is not int or resource['workers'] < 1):  # 显式正整数作为使用者指定的并发上限。
         raise ValueError('workers 必须为 auto 或正整数')  # 拒绝布尔值、零、负数和无法解释的字符串。
@@ -361,7 +369,7 @@ def _sample_memory(stop, sample):  # RSS 为父进程及所有存活子进程的
         stop.wait(0.05)  # 等待最多 50 毫秒后再次采样或响应停止信号。
 
 
-def _run_jobs(cases, jobs, out, workers, threads, chunk_size, pending_factor, fingerprint):  # 限制队列中尚未完成的分块数，并在每帧返回后立即原子落盘。
+def _run_jobs(cases, jobs, out, workers, threads, chunk_size, pending_factor, fingerprint, write_tables=True, on_record=None):  # 一个进程池只负责当前阶段的帧任务。
     # 限制队列中尚未完成的分块数，并在每帧返回后立即原子落盘。
     out = Path(out)  # 计算并保存当前模式的独立输出目录。
     out.mkdir(parents=True, exist_ok=True)  # 调用 out.mkdir 完成本行所示的处理。
@@ -378,6 +386,8 @@ def _run_jobs(cases, jobs, out, workers, threads, chunk_size, pending_factor, fi
             checkpoint = out / 'checkpoints' / record['case_id'] / f"{record['frame']:09d}.json"  # 根据案例和帧号隔离检查点。
             _atomic_json(checkpoint, record)  # 在同目录安全提交该帧。
             records.append(record)  # 汇总已成功落盘的记录。
+            if on_record is not None:  # 分工况执行时及时同步外层汇总，不等整个工况返回后才保留结果。
+                on_record(record)  # 只有检查点已成功落盘的帧才会加入外层结果。
     def failed(chunk, error):  # 按任务块生成明确的逐帧失败记录。
         return [{'case_id': cid, 'frame': frame, 'status': 'failed', 'error': error, 'families': {}, 'lines': []} for cid, frame in chunk]  # 失败数值保持缺失而不是伪造为零。
     try:  # 开始受控操作，并在失败时交由异常分支处理。
@@ -425,11 +435,123 @@ def _run_jobs(cases, jobs, out, workers, threads, chunk_size, pending_factor, fi
             if fatal is not None:  # 记录所有还未完成、尚未提交和提交失败的帧。
                 for chunk in list(pending.values()) + orphaned + list(iterator):  # 按真实任务清单覆盖剩余全部块。
                     persist(failed(chunk, fatal))  # 逐帧写失败检查点，防止遗漏。
-        _write_tables(out, records)  # 生成帧、位错族和逐线 CSV；此耗时纳入候选计时。
+        if write_tables:  # 分阶段运行时交给外层统一写表，避免后工况覆盖前工况。
+            _write_tables(out, records)  # 独立调用仍保留原来的故障汇总行为。
     finally:  # 无论是否发生异常，都执行清理和收尾操作。
         stop.set()  # 通知采样线程停止读取进程状态。
         sampler.join()  # 等待采样线程退出后读取最终采样峰值。
     return records, time.perf_counter() - started, peak[0]  # 返回实际帧结果、包含落盘的墙钟时间及采样峰值 RSS。
+
+
+def _run_scheduled_jobs(cases, jobs, out, resources, particle_estimates, fingerprint, retained=None, verify=None):  # 按已选择策略执行，默认逐工况建池并在退出后再处理下一工况。
+    import psutil  # 每个工况开始前读取当时可用资源，不复用前一个工况的预算。
+    started = time.perf_counter()  # 总耗时包括全部进程池启动、工况切换和最终汇总。
+    out = Path(out)  # 所有阶段和汇总使用同一个明确的输出根目录。
+    out.mkdir(parents=True, exist_ok=True)  # 资源规划失败时也能写出空汇总，不让目录错误掩盖真正原因。
+    retained = retained or []  # 续算时把已验证的旧结果纳入最终表格。
+    scheduling = resources.get('scheduling', 'case_sequential')  # 没有明确选择时使用用户原脚本的调度范围。
+    grouped = {case['id']: [] for case in cases}  # 保持清单中已确认的工况顺序。
+    for job in jobs:  # 将待算任务归入所属工况，避免续算重复处理已完成帧。
+        grouped[job[0]].append(job)  # 分组只影响调度，不改变帧映射。
+    groups = [jobs] if scheduling == 'cross_case' and jobs else [grouped[case['id']] for case in cases if grouped[case['id']]]  # 跨工况只在已授权且有证据的路径使用一个混合池。
+    stages, records, peak = [], [], 0  # 记录每个实际阶段及已落盘结果。
+    active_ids = {cid for cid, frame in jobs}  # 仅保留仍有工作量的案例。
+    plan = {'scheduling': scheduling, 'requested_workers': resources['workers'], 'job_count': len(jobs), 'particle_estimates': {cid: value for cid, value in particle_estimates.items() if cid in active_ids}, 'stages': stages}  # 汇总规划不把多个顺序阶段伪装成同时并发。
+    parent_rss = psutil.Process().memory_info().rss  # 总体资源判断以所有阶段开始前的父进程占用为起点。
+    memory_budget = int(psutil.virtual_memory().available * (1 - resources['reserve_memory_fraction']))  # 总体预算还覆盖最终汇总过程中的额外内存。
+    full_peak, stop = [0], threading.Event()  # 外层采样覆盖阶段间切换及最终 CSV 汇总。
+    sampler = threading.Thread(target=_sample_memory, args=(stop, full_peak), daemon=True)  # 阶段采样仍保留，用于每个工况独立的资源检查。
+    sampler.start()  # 在第一个工况规划前开始总体内存观测。
+    try:  # 即使中途停止，也保存已经完成的工况及保留结果。
+        for group in groups:  # 一个阶段完成并释放进程池后才进入下一个阶段。
+            ids = {cid for cid, frame in group}  # 当前阶段实际涉及的工况集合。
+            stage_cases = [case for case in cases if case['id'] in ids]  # 仅把当前工况配置传给其工作进程。
+            estimates = {cid: particle_estimates[cid] for cid in ids}  # 大工况不压低其他工况独立运行时的并发数。
+            per_worker = max(384 * 1048576 + 4096 * max(value['particle_count'] for value in estimates.values()), max(value.get('measured_worker_memory_bytes', 0) for value in estimates.values()))  # 有同轮可选比较的实测记录时采用更保守者，默认运行不额外试跑。
+            cpu = _available_cpu()  # 刷新当前进程可用逻辑 CPU 数。
+            stage = _plan_resources(resources, len(group), cpu, psutil.virtual_memory().available, psutil.Process().memory_info().rss, per_worker, 61 if os.name == 'nt' else cpu)  # 每工况重新规划实际进程数。
+            stage.update(case_ids=[case['id'] for case in stage_cases], particle_estimates=estimates, started_unix=time.time())  # 记录真实阶段边界及数据规模依据。
+            stages.append(stage)  # 启动前即记录本阶段，便于识别中断位置。
+            reason_names = {'cpu': 'CPU 预算', 'tasks': '帧块数', 'memory': '内存预算', 'platform': '平台上限', 'requested': '用户上限'}  # 把内部限制标识翻译成可核查的中文说明。
+            print(f"处理工况：{', '.join(stage['case_ids'])}；{stage['workers']} 个进程 × 每进程 {stage['ovito_threads']} 个 OVITO 线程；待算 {len(group)} 帧／{stage['task_chunks']} 块；CPU 可用 {stage['cpu_available']}／预算 {stage['cpu_budget']}；内存预算 {stage['memory_budget_bytes'] / 1048576:.1f} MiB／每进程估算 {per_worker / 1048576:.1f} MiB；限制：{', '.join(reason_names[key] for key in stage['limiting_factors'])}。", flush=True)  # 每个工况启动时显示实际配置及选择依据。
+            batch, elapsed, stage_peak = _run_jobs(stage_cases, group, out, stage['workers'], stage['ovito_threads'], resources['chunk_size'], resources['max_pending_factor'], fingerprint, write_tables=False, on_record=records.append)  # 每个 worker 复用流水线；每帧落盘后立即同步外层，以保留中断前已完成帧。
+            peak = max(peak, stage_peak)  # 顺序阶段的峰值取最大值，不能相加冒充同时占用。
+            stage.update(finished_unix=time.time(), elapsed_seconds=elapsed, peak_rss_bytes_sampled=stage_peak)  # 记录包含进程池退出的阶段完成时间。
+            stage['resource_ok'] = max(0, stage_peak - stage['parent_rss_bytes']) <= stage['memory_budget_bytes'] and stage['workers'] * stage['ovito_threads'] <= stage['cpu_budget']  # 可选比较只接受资源合格的阶段。
+            if verify is not None:  # 工况间及时核对来源是否发生变化。
+                verify()  # 输入改变时停止下一工况，避免继续产生混合身份结果。
+    finally:  # 中断时仍写出已完成帧，未处理帧可按检查点续算。
+        active_error = sys.exc_info()[0] is not None  # 若已有主异常，后续汇总错误不能覆盖真正的停止原因。
+        try:  # 保持统一输出也处于总体内存采样范围内。
+            _write_tables(out, retained + records)  # 汇总全部已完成工况及当前工况已经成功落盘的帧。
+        except Exception as exc:  # 文件系统错误应保留，但不掩盖已有计算或资源错误。
+            if not active_error:  # 正常计算后的汇总失败仍必须让运行失败。
+                raise  # 禁止把缺少完整汇总的运行报告成完成。
+            print(f'写入部分汇总时另遇错误：{exc}；已落盘检查点可用于续算。', file=sys.stderr)  # 保留主异常并告知额外输出问题。
+        finally:  # 无论汇总是否成功，都结束采样线程。
+            stop.set()  # 在最终汇总结束后才停止观察总体峰值。
+            sampler.join()  # 等待最后一次采样结束。
+    peak = max(peak, full_peak[0])  # 不漏掉阶段间或最终表格扁平化时出现的峰值。
+    plan.update(parent_rss_bytes=parent_rss, memory_budget_bytes=memory_budget, peak_rss_bytes_sampled=peak, resource_ok=all(stage['resource_ok'] for stage in stages) and max(0, peak - parent_rss) <= memory_budget)  # 同时检查各阶段及最终汇总的资源合格性。
+    return records, time.perf_counter() - started, peak, plan  # 返回新计算记录及完整执行规划。
+
+
+def _resource_policy(resources):  # 提取决定调度比较的配置，不把报告路径或待验证调度名称放入自身指纹。
+    keys = ('workers', 'ovito_threads', 'chunk_size', 'max_pending_factor', 'reserve_cpu_fraction', 'reserve_memory_fraction', 'benchmark_max_frames')  # 只保留两种策略需一致的资源及抽样约束。
+    return {key: resources[key] for key in keys}  # 配置变化后不得直接沿用旧调度比较。
+
+
+def _machine_signature():  # 只保存匿名哈希，不把机器名称写进共享报告。
+    import psutil  # 获取当前机器可用的 CPU 范围及总内存。
+    value = [platform.node(), platform.system(), platform.machine(), _available_cpu(), psutil.virtual_memory().total]  # 相同数据在另一台机器上不能直接复用性能判断。
+    return hashlib.sha256(json.dumps(value).encode('utf-8')).hexdigest()  # 保存可核验的机器签名。
+
+
+def _scheduling_eligible(trials):  # 严格用两轮实测判断跨工况是否确有收益，不设固定工况数量阈值。
+    groups = {mode: [row for row in trials if row.get('scheduling') == mode] for mode in ('case_sequential', 'cross_case')}  # 分别取得两种策略的完整计时。
+    if len(trials) != 4 or any(len(rows) != 2 or {row.get('round') for row in rows} != {1, 2} for rows in groups.values()):  # 不接受缺轮次或重复轮次的比较。
+        return False  # 证据不足时保持默认逐工况策略。
+    if any(row.get('consistent') is not True or row.get('resource_ok') is not True or type(row.get('elapsed_seconds')) not in (int, float) or not math.isfinite(row['elapsed_seconds']) or row['elapsed_seconds'] <= 0 for row in trials):  # 所有候选都必须完成科学与资源检查。
+        return False  # 不把失败或无效耗时解释成提速。
+    return max(row['elapsed_seconds'] for row in groups['cross_case']) < min(row['elapsed_seconds'] for row in groups['case_sequential'])  # 跨工况较慢一轮仍须快于逐工况较快一轮，避免按微小单次波动切换。
+
+
+def _validate_scheduling_evidence(resources, fingerprint):  # 正式运行采用跨工况前验证与当前任务对应的实测报告。
+    path = resources.get('scheduling_evidence')  # 使用者应明确提供已查看的比较报告。
+    if not path:  # 不能仅因为文件很多就自动改用跨工况池。
+        raise ValueError('cross_case 需要 scheduling_evidence；请先按需执行 --mode scheduling 比较代表帧')  # 指出缺少实测证据，不自动启动比较。
+    report = json.loads(Path(path).read_text(encoding='utf-8'))  # 仅读取已存在的报告，不执行任何额外 DXA。
+    if report.get('kind') != 'scheduling_comparison' or report.get('_content_sha256') != _record_digest(report):  # 排除内容损坏或错误类型的报告。
+        raise ValueError('调度比较报告类型或内容摘要不符')  # 不能凭一个手写推荐值切换。
+    if report.get('fingerprint') != fingerprint or report.get('resource_policy') != _resource_policy(resources) or report.get('machine_signature') != _machine_signature():  # 科学输入、策略参数或运行机器变化后需要重新验证。
+        raise ValueError('调度比较报告与当前输入、科学设置、资源策略或机器不兼容')  # 不静默复用旧的性能结论。
+    if report.get('eligible_for_cross_case') is not True or not _scheduling_eligible(report.get('trials', [])):  # 从各轮记录重新核查收益，避免只相信推荐字段。
+        raise ValueError('小样本比较未证明跨工况调度有稳定收益，保持 case_sequential')  # 明确此次仍应采用逐工况策略。
+    return str(Path(path).resolve())  # 在执行记录中保存实际使用的证据来源。
+
+
+def _compare_scheduling(cases, sample_jobs, out, resources, particle_estimates, fingerprint, verify, preflight):  # 仅按需比较调度范围，不在默认运行中额外试跑。
+    trials, reference = [], None  # 第一轮逐工况结果作为科学一致性参照，不增加单进程基线。
+    for round_number, order in enumerate((('case_sequential', 'cross_case'), ('cross_case', 'case_sequential')), 1):  # 第二轮反转顺序，减少单一缓存顺序造成的偏差。
+        for scheduling in order:  # 两种策略使用同一代表帧、科学参数和总资源预算。
+            trial_resources = dict(resources, scheduling=scheduling)  # 每种策略内部仍按资源和帧数自动确定并发。
+            trial_out = out / f'round_{round_number}_{scheduling}'  # 隔离各轮输出，避免覆盖或混用检查点。
+            records, elapsed, peak, plan = _run_scheduled_jobs(cases, sample_jobs, trial_out, trial_resources, particle_estimates, fingerprint, verify=verify)  # 包括工况切换、进程启动及落盘的完整耗时。
+            if reference is None:  # 只保存第一轮实际结果作为参照。
+                reference = records  # 失败与无晶态状态仍会由一致性检查拒绝。
+            trials.append({'round': round_number, 'scheduling': scheduling, 'elapsed_seconds': elapsed, 'peak_rss_bytes_sampled': peak, 'consistent': _same_results(reference, records, cases), 'resource_ok': plan['resource_ok'], 'resource_plan': plan})  # 资源判定覆盖阶段计算和最终统一汇总。
+    eligible = _scheduling_eligible(trials)  # 仅当所有结果合格且耗时区间不重叠时才证明当前样本有收益。
+    report = {'schema_version': 1, 'kind': 'scheduling_comparison', 'fingerprint': fingerprint, 'resource_policy': _resource_policy(resources), 'machine_signature': _machine_signature(), 'sample_jobs': sample_jobs, 'unsampled_case_ids': [case['id'] for case in cases if case['id'] not in {cid for cid, frame in sample_jobs}], 'preflight_seconds': preflight, 'trials': trials, 'eligible_for_cross_case': eligible, 'recommended_schedule': 'cross_case' if eligible else 'case_sequential'}  # 完整记录证据适用的输入、配置、机器与样本范围。
+    report['_content_sha256'] = _record_digest(report)  # 恢复或正式运行前检查报告内容是否损坏。
+    _atomic_json(out / 'report.json', report)  # 先安全提交机器可读证据，再生成可视报告。
+    fields = ['round', 'scheduling', 'elapsed_seconds', 'peak_rss_bytes_sampled', 'consistent', 'resource_ok']  # 表中所有数值均来自本次实际试跑。
+    _write_csv(out / 'comparisons.csv', fields, trials)  # 方便使用者进一步比较与归档。
+    names = {'case_sequential': '逐工况、工况内并行', 'cross_case': '跨工况共同调度'}  # 在 HTML 中使用明确的中文策略名。
+    rows = ''.join(f"<tr><td>{row['round']}</td><td>{names[row['scheduling']]}</td><td>{row['elapsed_seconds']:.3f}</td><td>{row['peak_rss_bytes_sampled'] / 1048576:.1f}</td><td>{'是' if row['consistent'] else '否'}</td><td>{'是' if row['resource_ok'] else '否'}</td></tr>" for row in trials)  # 按实际执行顺序展示两轮结果。
+    conclusion = '当前代表样本支持跨工况共同调度；只有使用者明确选择后才切换。' if eligible else '当前代表样本未证明跨工况调度有稳定收益，保持默认逐工况处理。'  # 不把耗时接近或失败当作提速。
+    page = '<!doctype html><html lang="zh"><meta charset="utf-8"><title>DXA 调度比较</title><style>body{max-width:1000px;margin:36px auto;padding:0 20px;font:16px/1.7 sans-serif;color:#243647}table{border-collapse:collapse;width:100%}th,td{padding:10px;border-bottom:1px solid #ccd6df;text-align:left}</style><h1>DXA 调度比较</h1><p>' + conclusion + '</p><p>两轮使用相同代表帧，第二轮交换执行顺序。通过条件：全部科学结果一致且资源合格，并且跨工况较慢一轮仍快于逐工况较快一轮。此判断不证明全轨迹更快，也不建立通用工况数量阈值。</p><table><tr><th>轮次</th><th>策略</th><th>完整耗时（秒）</th><th>采样峰值 RSS（MiB）</th><th>结果一致</th><th>资源合格</th></tr>' + rows + '</table><p>代表帧：' + html.escape(str(sample_jobs)) + '</p><p>未抽样工况：' + html.escape(str(report['unsampled_case_ids'])) + '</p></html>'  # 自包含报告不依赖联网资源或绘图库。
+    (out / 'report.html').write_text(page, encoding='utf-8')  # 使用者可直接查看证据再选择是否改变策略。
+    print(f'调度比较完成：{out}；建议 {report["recommended_schedule"]}', flush=True)  # 明确输出建议，不自动修改正式清单。
 
 
 def _write_csv(path, fields, rows):  # 汇总表仅由主进程写入，并原子替换避免出现半份表格。
@@ -489,7 +611,7 @@ def _report(out, rows, recommendation, preflight, context=None):  # 本地自包
     measured = [r for r in rows if r.get('elapsed_seconds') is not None]  # 计算并保存变量 measured 的当前值。
     maximum = max([r['elapsed_seconds'] for r in measured] or [1])  # 计算并保存变量 maximum 的当前值。
     bars = ''.join(f'<text x="5" y="{28 + i * 36}">{r["workers"]} × {r["ovito_threads"]}</text><rect x="95" y="{13 + i * 36}" width="{400 * r["elapsed_seconds"] / maximum:.1f}" height="18" fill="#467ba3"/><text x="{102 + 400 * r["elapsed_seconds"] / maximum:.1f}" y="{28 + i * 36}">{r["elapsed_seconds"]:.2f} 秒</text>' for i, r in enumerate(measured))  # 计算并保存变量 bars 的当前值。
-    labels = ['进程数', '每进程线程数', '耗时（秒）', '采样峰值 RSS（MiB）', '相对串行倍率', '成功帧', '失败帧', '结果一致', '资源合格', '推荐', '说明']  # 与机器可读长表保持相同列序。
+    labels = ['每工况进程上限', '每进程线程数', '耗时（秒）', '采样峰值 RSS（MiB）', '相对串行倍率', '成功帧', '失败帧', '结果一致', '资源合格', '推荐', '说明']  # 与机器可读长表保持相同列序。
     def display(r, key):  # 定义 display 函数，封装这一处理步骤。
         value = r.get(key)  # 计算并保存变量 value 的当前值。
         if value is None:  # 检查本行条件，满足时执行其下的分支。
@@ -515,7 +637,7 @@ def _report(out, rows, recommendation, preflight, context=None):  # 本地自包
         'th,td{padding:10px 12px;text-align:left;border-bottom:1px solid #e9eef3}th{background:#edf2f7;font-weight:600}tr:last-child td{border-bottom:0}'  # 使多列统计容易逐行比较。
         '.recommendation{padding:14px 18px;background:#e8f2ee;border-left:4px solid #377b65;border-radius:6px;color:#204d3f;font-weight:600}'  # 明确显示本次样本的推荐设置。
     )  # CSS 不依赖联网字体或外部资源。
-    recommendation_label = '没有满足结果一致性与资源约束的候选配置。' if not recommendation else f"本次样本推荐：{recommendation['workers']} 个进程；每进程 {'OVITO 自动线程' if recommendation['ovito_threads'] == 'auto' else str(recommendation['ovito_threads']) + ' 个线程'}。"  # 将内部配置转为使用者可读的句子。
+    recommendation_label = '没有满足结果一致性与资源约束的候选配置。' if not recommendation else f"本次样本推荐：每工况最多 {recommendation['workers']} 个进程；每进程 {'OVITO 自动线程' if recommendation['ovito_threads'] == 'auto' else str(recommendation['ovito_threads']) + ' 个线程'}。"  # 将内部配置转为使用者可读的句子。
     page = page.replace('<meta charset="utf-8">', '<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><style>' + style + '</style>')  # 让桌面和窄窗口均可查看报告。
     page = page.replace('<h1>DXA 基准</h1>', '<h1>DXA 性能比较</h1><p>横条越短表示耗时越少；倍率大于 1 表示比本运行器的串行基线更快。</p>')  # 解释图表和倍率的读取方式。
     page = page.replace('<p>推荐：' + html.escape(str(recommendation)) + '</p>', '<p class="recommendation">' + html.escape(recommendation_label) + '</p>')  # 展示已通过验收的推荐，不泄露实现式字典。
@@ -535,10 +657,12 @@ def main(argv=None):  # 默认直接正式分析；Notebook 薄入口可传入�
     # 命令入口只读取明确确认的清单，并区分新运行与恢复运行。
     parser = argparse.ArgumentParser(description='OVITO DXA 可验证批处理')  # 计算并保存变量 parser 的当前值。
     parser.add_argument('--config', required=True)  # 调用 parser.add_argument 完成本行所示的处理。
-    parser.add_argument('--mode', choices=['baseline', 'benchmark', 'run', 'resume'], default='run', help='默认 run 直接分析；baseline/benchmark 仅显式请求时抽样试跑')  # 不自动执行单进程对照或性能搜索。
+    parser.add_argument('--mode', choices=['baseline', 'benchmark', 'scheduling', 'run', 'resume'], default='run', help='默认逐工况 run；baseline/benchmark/scheduling 仅显式请求时抽样比较')  # 不自动执行单进程对照或跨工况性能搜索。
     args = parser.parse_args(argv)  # 未传列表时读取命令行，薄入口传列表时不修改 Notebook 参数。
     config = _normalize_config(args.config)  # 计算并保存任务清单。
     resources, cases = config['resources'], config['cases']  # 计算并保存执行资源限制。
+    if args.mode == 'scheduling' and (len(cases) < 2 or resources['benchmark_max_frames'] < 2):  # 一个工况无法比较跨工况调度，样本也至少需要覆盖两组。
+        raise ValueError('调度比较至少需要两个工况和两个代表帧；单工况保持 case_sequential')  # 不为凑比较重复计算同一工况。
     out = Path(config['output_dir']) / ('run' if args.mode == 'resume' else args.mode)  # 计算并保存当前模式的独立输出目录。
     if args.mode == 'resume':  # 检查本行条件，满足时执行其下的分支。
         if not (out / 'manifest.json').is_file():  # 不满足要求时拒绝执行：没有可恢复的 run/manifest.json。
@@ -580,6 +704,8 @@ def main(argv=None):  # 默认直接正式分析；Notebook 薄入口可传入�
     scientific = {'schema_version': 1, 'cases': cases, 'source_sha256': source_hashes, 'source_stat': source_stats, 'metadata': metadata, 'frames': frames, 'python_version': sys.version, 'ovito_version': next(iter(versions))}  # 计算并保存变量 scientific 的当前值。
     fingerprint = hashlib.sha256(json.dumps(scientific, sort_keys=True, ensure_ascii=False).encode('utf-8')).hexdigest()  # 将源 SHA、帧映射、科学设置和版本合并为恢复指纹。
     manifest = {'fingerprint': fingerprint, 'scientific': scientific, 'resources': resources, 'source_scan': scans}  # 记录每个文件的检查覆盖及原因；扫描耗时不参与指纹。
+    if args.mode in ('run', 'resume') and resources['scheduling'] == 'cross_case':  # 正式跨工况运行必须有与当前任务对应的可核查收益证据。
+        manifest['scheduling_evidence'] = _validate_scheduling_evidence(resources, fingerprint)  # 不自动进行额外比较，也不凭工况数量切换。
     preflight = time.perf_counter() - preflight_start  # 计算并保存变量 preflight 的当前值。
     if args.mode == 'resume':  # 检查本行条件，满足时执行其下的分支。
         old = json.loads((out / 'manifest.json').read_text(encoding='utf-8'))  # 计算并保存变量 old 的当前值。
@@ -589,35 +715,34 @@ def main(argv=None):  # 默认直接正式分析；Notebook 薄入口可传入�
         out.mkdir(parents=True, exist_ok=False)  # 调用 out.mkdir 完成本行所示的处理。
         _atomic_json(out / 'manifest.json', manifest)  # 调用 _atomic_json 完成本行所示的处理。
     all_jobs = [(case['id'], frame) for case in cases for frame in frames[case['id']]]  # 建立所有案例和所选帧的一一对应任务。
-    sample_jobs = _sample_jobs(cases, frames, resources['benchmark_max_frames']) if args.mode in ('baseline', 'benchmark') else []  # 正式运行不计算试跑样本，也不先执行单进程。
-    parent_rss = psutil.Process().memory_info().rss  # 计算并保存主进程当前常驻内存。
+    sample_jobs = _sample_jobs(cases, frames, resources['benchmark_max_frames']) if args.mode in ('baseline', 'benchmark', 'scheduling') else []  # 正式运行不计算试跑样本，也不先执行单进程。
     particle_estimates = _particle_estimates(cases, metadata, scans)  # 复用已扫描的文本数量头，覆盖可变粒子数而不增加 DXA 试跑。
-    per_worker_estimate = 384 * 1048576 + 4096 * max(item['particle_count'] for item in particle_estimates.values())  # 启发式估算每个 worker 的基础开销与粒子数据，不承诺它是实际峰值上界。
     available_memory = psutil.virtual_memory().available  # 在可能较长的哈希和预检之后重新读取可用内存。
-    memory_limit = available_memory * (1 - resources['reserve_memory_fraction'])  # 从当前可用内存中保留用户要求的余量。
     memory_note = '每进程启发式估算 384 MiB 加每原子 4096 字节；文本 dump 使用已扫描数量头最大值，其他来源采用首帧及可用头信息；不是 DXA 内存峰值保证，未自动进行计时或内存试跑'  # 说明默认自动选择的证据和能力边界。
+    if args.mode == 'scheduling':  # 只有使用者显式要求时才比较两种调度范围。
+        _compare_scheduling(cases, sample_jobs, out, resources, particle_estimates, fingerprint, lambda: _verify_sources(source_stats, out, manifest), preflight)  # 只对有限样本做双轮比较，结果仅作为待选择证据。
+        return  # 不在比较后自动执行全量或改写用户配置。
     if args.mode == 'benchmark':  # 检查本行条件，满足时执行其下的分支。
         rows, reference = [], None  # 计算并保存性能报告中的候选配置记录。
         sampled_cases = {cid for cid, frame in sample_jobs}  # 可选比较只考虑实际抽到的案例。
-        per_worker_estimate = 384 * 1048576 + 4096 * max(particle_estimates[cid]['particle_count'] for cid in sampled_cases)  # 未抽到的大案例不压低当前样本的资源配置。
+        benchmark_estimates = {cid: dict(value) for cid, value in particle_estimates.items()}  # 可选并发比较单独累积每工况观测内存，不改变默认启动估算或科学定义。
         cpu = _available_cpu()  # 候选构建前刷新当前可用逻辑 CPU 数。
-        candidates, benchmark_cpu_budget = _benchmark_candidates(resources, len(sample_jobs), cpu, 61 if os.name == 'nt' else cpu)  # 可选比较和正式运行遵守相同的 CPU 预留及用户上限。
+        largest_case_jobs = max(sum(cid == case_id for cid, frame in sample_jobs) for case_id in sampled_cases)  # 逐工况候选上限由最大单工况帧块数决定。
+        candidates, benchmark_cpu_budget = _benchmark_candidates(resources, largest_case_jobs, cpu, 61 if os.name == 'nt' else cpu)  # 可选比较仍保持逐工况范围，不隐式尝试跨工况池。
         for workers, threads in candidates:  # 逐项遍历当前集合，分别执行缩进内的操作。
-            measured = [r for r in rows if r.get('peak_rss_bytes') is not None]  # 计算并保存变量 measured 的当前值。
-            observed = max([max(0, r['peak_rss_bytes'] - parent_rss) / r['workers'] for r in measured] or [0])  # 计算并保存变量 observed 的当前值。
-            estimated_rss = workers * max(per_worker_estimate, observed)  # available 已排除父进程占用，只对新增 worker 预算比较增量内存。
-            if estimated_rss > memory_limit:  # 启动前排除预计超过预留内存限额的配置。
-                rows.append({'workers': workers, 'ovito_threads': threads, 'elapsed_seconds': None, 'peak_rss_bytes': None, 'speedup': None, 'consistent': False, 'resource_ok': False, 'recommended': False, 'note': '启动前内存估计超过限额，未运行'})  # 调用 rows.append 完成本行所示的处理。
-                continue  # 跳过当前项，继续处理下一项。
             trial = out / f'workers_{workers}_threads_{threads}'  # 计算并保存变量 trial 的当前值。
-            records, elapsed, peak = _run_jobs(cases, sample_jobs, trial, workers, threads, resources['chunk_size'], resources['max_pending_factor'], fingerprint)  # 计算并保存当前批次的帧结果。
-            _verify_sources(source_stats, out, manifest)  # 调用 _verify_sources 完成本行所示的处理。
+            trial_resources = dict(resources, workers=workers, ovito_threads=threads, scheduling='case_sequential')  # 只探索工况内并发上限，使用与正式默认运行相同的调度范围。
+            records, elapsed, peak, trial_plan = _run_scheduled_jobs(cases, sample_jobs, trial, trial_resources, benchmark_estimates, fingerprint, verify=lambda: _verify_sources(source_stats, out, manifest))  # 每工况单独评估内存，不用大工况的规模限制所有小工况。
+            for stage in trial_plan['stages']:  # 后续候选考虑已观测的每工况增量 RSS，避免只相信初始启发式。
+                observed = math.ceil(max(0, stage['peak_rss_bytes_sampled'] - stage['parent_rss_bytes']) / stage['workers'])  # 观测只作为采样估算，不承诺精确的单进程独占峰值。
+                for cid in stage['case_ids']:  # 当前 benchmark 每阶段只有一个工况，保留通用的对应关系。
+                    benchmark_estimates[cid] = dict(benchmark_estimates[cid], measured_worker_memory_bytes=max(observed, benchmark_estimates[cid].get('measured_worker_memory_bytes', 0)))  # 用新字典避免回写已存入报告的前一候选记录。
             if reference is None:  # 检查本行条件，满足时执行其下的分支。
                 reference = records  # 计算并保存单进程代表帧对照结果。
                 baseline = elapsed  # 计算并保存变量 baseline 的当前值。
-            memory_ok = max(0, peak - parent_rss) <= memory_limit and workers * threads <= benchmark_cpu_budget  # 同时检查实测增量 RSS 和 CPU 预算，避免超预算候选被标为资源合格。
+            memory_ok = trial_plan['resource_ok']  # 只有计算阶段和最终汇总的 CPU 与实测内存均合格时才允许推荐。
             warning = '所有代表帧均未识别到晶态原子' if records and all(r['status'] == 'no_crystalline_atoms' for r in records) else ''  # 计算并保存需要报告的科学边界提示。
-            rows.append({'workers': workers, 'ovito_threads': threads, 'elapsed_seconds': elapsed, 'peak_rss_bytes': peak, 'speedup': baseline / elapsed, 'completed': sum(r['status'] in _OK for r in records), 'failed': sum(r['status'] not in _OK for r in records), 'consistent': _same_results(reference, records, cases), 'resource_ok': memory_ok, 'recommended': False, 'note': warning})  # 按成功帧、失败帧及科学一致性评价候选。
+            rows.append({'workers': workers, 'ovito_threads': threads, 'elapsed_seconds': elapsed, 'peak_rss_bytes': peak, 'speedup': baseline / elapsed, 'completed': sum(r['status'] in _OK for r in records), 'failed': sum(r['status'] not in _OK for r in records), 'consistent': _same_results(reference, records, cases), 'resource_ok': memory_ok, 'resource_plan': trial_plan, 'recommended': False, 'note': warning})  # 进程列表示每工况上限，各工况实际配置在阶段记录内。
         valid = [r for r in rows if r['consistent'] and r['resource_ok']]  # 计算并保存结果一致且资源合格的候选。
         best = min(valid, key=lambda r: r['elapsed_seconds']) if valid else None  # 计算并保存通过条件的最快候选配置。
         if best is not None:  # 检查本行条件，满足时执行其下的分支。
@@ -648,25 +773,17 @@ def main(argv=None):  # 默认直接正式分析；Notebook 薄入口可传入�
             except (OSError, ValueError, KeyError, json.JSONDecodeError):  # 捕获指定错误并执行相应的恢复或报告。
                 missing.append((cid, frame))  # 损坏、缺失或失败的检查点重新加入待处理队列。
         jobs = missing  # 计算并保存待处理帧任务。
-    pending_cases = {cid for cid, frame in jobs}  # 续算只对实际仍待计算的案例分配资源。
-    active_estimates = {cid: value for cid, value in particle_estimates.items() if cid in pending_cases}  # 已完成的大案例不再压低本次续算并发数。
-    per_worker_estimate = 384 * 1048576 + 4096 * max([item['particle_count'] for item in active_estimates.values()] or [0])  # 只使用当前任务的粒子规模，空任务不会启动 worker。
-    actual_resources = dict(resources, workers=1, ovito_threads='auto') if args.mode == 'baseline' else resources  # 仅显式 baseline 才做单进程对照，内部线程仍受 CPU 预留预算约束。
-    resource_plan = _plan_resources(actual_resources, len(jobs), _available_cpu(), psutil.virtual_memory().available, psutil.Process().memory_info().rss, per_worker_estimate, 61 if os.name == 'nt' else _available_cpu())  # 启动前重新读取资源，并按所有实际约束选取进程数。
-    resource_plan['particle_estimates'] = active_estimates  # 保存各待处理案例粒子规模及扫描覆盖情况。
-    workers, threads = resource_plan['workers'], resource_plan['ovito_threads']  # 执行已规划的进程与线程配置，不再采用固定默认数量。
-    if jobs:  # 有实际计算时展示选择依据；纯续算核验不报告虚构计算资源。
-        print(f"资源选择：请求进程数 {actual_resources['workers']}；CPU 可用 {resource_plan['cpu_available']} / 预算 {resource_plan['cpu_budget']}；待算 {len(jobs)} 帧 / {resource_plan['task_chunks']} 块；内存预算 {resource_plan['memory_budget_bytes'] / 1048576:.1f} MiB / 每进程估算 {per_worker_estimate / 1048576:.1f} MiB；限制因素 {', '.join(resource_plan['limiting_factors'])}。", flush=True)  # 让使用者在启动时核对自动并发选择。
-    print(f'执行配置：{workers} 个工作进程，每进程 OVITO 线程数 {threads}；待计算 {len(jobs)} 帧，已复用 {len(retained)} 帧。' if jobs else f'本次没有待计算帧；复用了 {len(retained)} 帧，未启动 DXA 计算进程。', flush=True)  # 启动前展示实际配置，区分只核验检查点与真正计算。
-    records, elapsed, peak = _run_jobs(cases, jobs, out, workers, threads, resources['chunk_size'], resources['max_pending_factor'], fingerprint) if jobs else ([], 0, 0)  # 计算并保存当前批次的帧结果。
+    actual_resources = dict(resources, workers=1, ovito_threads='auto', scheduling='case_sequential') if args.mode == 'baseline' else resources  # 仅显式 baseline 做样本单进程对照，仍按工况顺序执行。
+    print(f"执行策略：{actual_resources['scheduling']}；待算 {len(jobs)} 帧，已复用 {len(retained)} 帧。", flush=True)  # 每工况具体资源在其启动时再读取并显示。
+    records, elapsed, peak, resource_plan = _run_scheduled_jobs(cases, jobs, out, actual_resources, particle_estimates, fingerprint, retained=retained, verify=lambda: _verify_sources(source_stats, out, manifest))  # 全部工况共享汇总器，各工况按需独立并行计算。
     _verify_sources(source_stats, out, manifest)  # 调用 _verify_sources 完成本行所示的处理。
     records = retained + records  # 计算并保存当前批次的帧结果。
-    merge_started = time.perf_counter()  # 单独记录恢复运行的历史与新帧合并耗时。
-    if retained:  # 普通运行已在计时范围内写过表，不重复写入。
-        _write_tables(out, records)  # 恢复运行合并旧的成功帧与本次处理结果。
-    merge_seconds = time.perf_counter() - merge_started if retained else 0.0  # 不把恢复合并遗漏在耗时记录之外。
+    stages = resource_plan['stages']  # 每个阶段对应一个已结束的进程池，顺序执行时不相加并发数。
+    workers = max([stage['workers'] for stage in stages] or [0])  # 顶层进程数表示本次最大同时使用值。
+    thread_values = {stage['ovito_threads'] for stage in stages}  # auto 内部线程可能随工况并发数而改变。
+    threads = next(iter(thread_values)) if len(thread_values) == 1 else None  # 不同阶段配置不同时必须查看阶段记录，不能虚构统一线程数。
     warning = '所有已处理帧均未识别到晶态原子；请检查晶格、原子选区、边界和数据' if records and all(r['status'] == 'no_crystalline_atoms' for r in records) else ''  # 计算并保存需要报告的科学边界提示。
-    _atomic_json(out / 'execution.json', {'preflight_seconds': preflight, 'elapsed_seconds': elapsed, 'merge_seconds': merge_seconds, 'peak_rss_bytes_sampled': peak, 'workers': workers, 'ovito_threads': threads, 'memory_assumption': memory_note, 'estimated_peak_bytes_before_start': resource_plan['estimated_peak_bytes_before_start'], 'memory_limit_bytes': resource_plan['memory_budget_bytes'], 'resource_plan': resource_plan, 'completed': sum(r['status'] in _OK for r in records), 'failed': sum(r['status'] not in _OK for r in records), 'warning': warning})  # 保存实际配置、各项资源上限和限制因素，便于解释自动选择与续算。
+    _atomic_json(out / 'execution.json', {'preflight_seconds': preflight, 'elapsed_seconds': elapsed, 'merge_seconds': 0.0, 'peak_rss_bytes_sampled': peak, 'workers': workers, 'ovito_threads': threads, 'scheduling': actual_resources['scheduling'], 'memory_assumption': memory_note, 'resource_plan': resource_plan, 'completed': sum(r['status'] in _OK for r in records), 'failed': sum(r['status'] not in _OK for r in records), 'warning': warning})  # 汇总合并已计入 elapsed；完整资源上限及估算在每工况阶段内记录。
     if warning:  # 检查本行条件，满足时执行其下的分支。
         print('警告：' + warning, file=sys.stderr)  # 调用 print 完成本行所示的处理。
     if any(r['status'] not in _OK for r in records):  # 不满足要求时拒绝执行：部分帧失败，请检查 {out / 。
