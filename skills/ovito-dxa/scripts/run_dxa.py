@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-# 使用独立解释器执行；主进程永不导入 OVITO，避免污染线程设置。
+# 支持独立解释器和 Notebook 薄入口；本模块的主进程路径不导入 OVITO。
 import argparse  # 导入 argparse，用于解析命令行中的清单路径与执行模式。
 import concurrent.futures as futures  # 导入 concurrent.futures，用于调度可受限的进程池任务。
 from concurrent.futures.process import BrokenProcessPool  # 识别 worker 硬退出导致的不可恢复进程池损坏。
@@ -142,11 +142,11 @@ def _normalize_config(path):  # 校验科学字段，不猜测材料结构、原
         if 'frames' not in case:  # 不满足要求时拒绝执行：该案例：缺少 frames。
             raise ValueError(f'{ident}: 缺少 frames')  # 明确报告当前错误，避免继续产生误导性结果。
     resource = config.setdefault('resources', {})  # 计算并保存变量 resource 的当前值。
-    for key, default in [('workers', 1), ('chunk_size', 1), ('max_pending_factor', 2), ('benchmark_max_workers', 4)]:  # 逐项遍历当前集合，分别执行缩进内的操作。
+    for key, default in [('workers', 2), ('chunk_size', 1), ('max_pending_factor', 2), ('benchmark_max_workers', 4), ('benchmark_max_frames', 6)]:  # 默认从两个进程开始；可选对比最多抽取六帧，避免把全量串行作为前置。
         resource.setdefault(key, default)  # 调用 resource.setdefault 完成本行所示的处理。
         if type(resource[key]) is not int or resource[key] < 1:  # 不满足要求时拒绝执行：{key} 必须为正整数。
             raise ValueError(f'{key} 必须为正整数')  # 明确报告当前错误，避免继续产生误导性结果。
-    resource.setdefault('ovito_threads', 'auto')  # 调用 resource.setdefault 完成本行所示的处理。
+    resource.setdefault('ovito_threads', 1)  # 每进程默认一个 OVITO 线程，防止多进程叠加内部线程造成争抢。
     if resource['ovito_threads'] != 'auto' and (type(resource['ovito_threads']) is not int or resource['ovito_threads'] < 1):  # 不满足要求时拒绝执行：ovito_threads 必须为 auto 或正整数。
         raise ValueError('ovito_threads 必须为 auto 或正整数')  # 明确报告当前错误，避免继续产生误导性结果。
     resource.setdefault('reserve_memory_fraction', 0.25)  # 调用 resource.setdefault 完成本行所示的处理。
@@ -245,7 +245,7 @@ def _plain(value):  # 将 NumPy 标量转为可 JSON 序列化的普通数值。
 def _frame(case_id, frame):  # 此函数仅返回可序列化数据；CA 几何由对应 worker 先落盘。
     # 此函数仅返回可序列化数据；CA 几何由对应 worker 先落盘。
     case = _CASES[case_id]  # 计算并保存当前数据案例。
-    result = {'case_id': case_id, 'frame': frame, 'status': 'failed', 'error': '', 'families': {}, 'lines': []}  # 计算并保存可序列化的帧结果。
+    result = {'case_id': case_id, 'frame': frame, 'worker_pid': os.getpid(), 'status': 'failed', 'error': '', 'families': {}, 'lines': []}  # 同时记录实际处理此帧的进程编号，便于核验进程池工作情况。
     try:  # 开始受控操作，并在失败时交由异常分支处理。
         from ovito.io import export_file  # 导入 ovito，用于查询或调用当前进程的 OVITO。
         pipe, _ = _pipeline(case)  # 计算并保存当前进程私有的 OVITO 管线。
@@ -394,7 +394,7 @@ def _write_csv(path, fields, rows):  # 汇总表仅由主进程写入，并原�
 def _write_tables(out, records):  # 生成帧、位错族和逐线 CSV；此耗时纳入候选计时。
     # 行顺序固定为案例和所选帧；失败记录不填充虚构的零值。
     records = sorted(records, key=lambda r: (r['case_id'], r['frame']))  # 计算并保存当前批次的帧结果。
-    _write_csv(out / 'frames.csv', ['case_id', 'frame', 'timestep', 'time', 'total_line_length', 'cell_volume', 'density', 'density_m2', 'recognized_fraction', 'status', 'error'], records)  # 调用 _write_csv 完成本行所示的处理。
+    _write_csv(out / 'frames.csv', ['case_id', 'frame', 'timestep', 'time', 'total_line_length', 'cell_volume', 'density', 'density_m2', 'recognized_fraction', 'status', 'error', 'worker_pid'], records)  # 末列保留实际计算进程；它不参与科学结果一致性比较。
     families = [{'case_id': r['case_id'], 'frame': r['frame'], 'family': name, 'length': length} for r in records for name, length in r.get('families', {}).items()]  # 计算并保存变量 families 的当前值。
     _write_csv(out / 'families.csv', ['case_id', 'frame', 'family', 'length'], families)  # 调用 _write_csv 完成本行所示的处理。
     lines = [{'case_id': r['case_id'], 'frame': r['frame'], 'line_index': line['line_index'], 'length': line['length'], 'burgers_x': line['burgers_vector'][0], 'burgers_y': line['burgers_vector'][1], 'burgers_z': line['burgers_vector'][2]} for r in records for line in r.get('lines', [])]  # 计算并保存变量 lines 的当前值。
@@ -452,6 +452,9 @@ def _report(out, rows, recommendation, preflight, context=None):  # 本地自包
     table = ''.join('<tr>' + ''.join('<td>' + html.escape(display(r, k)) + '</td>' for k in fields) + '</tr>' for r in rows)  # 计算并保存变量 table 的当前值。
     page = '<!doctype html><html lang="zh"><meta charset="utf-8"><title>DXA 基准</title><h1>DXA 基准</h1>' + f'<p>共同预检和 SHA-256 耗时 {preflight:.3f} 秒。基准为本运行器单进程、OVITO 自动线程；没有实测原用户脚本。峰值 RSS 为每 50 毫秒采样的进程树总和，可能低估真实峰值。加速仅代表本次抽样。</p><svg width="620" height="{max(40, len(measured) * 36 + 10)}" role="img" aria-label="候选运行时间">{bars}</svg><table border="1"><tr>' + ''.join('<th>' + html.escape(k) + '</th>' for k in labels) + '</tr>' + table + '</table><p>推荐：' + html.escape(str(recommendation)) + '</p></html>'  # 计算并保存变量 page 的当前值。
     details = f"案例数：{context.get('case_count', '—')}；代表帧数：{context.get('sample_frame_count', '—')}；可用 CPU：{context.get('available_cpu', '—')}；预检可用内存：{context.get('available_memory_bytes', 0) / 1048576:.1f} MiB；Python：{context.get('python_version', '—')}；OVITO：{context.get('ovito_version', '—')}"  # 汇总解释本次测试环境所需的最小信息。
+    unsampled = context.get('unsampled_case_ids', [])  # 读取因全局样本限额而未参与计时的案例。
+    if unsampled:  # 不能把未抽到的工况误表述为已经通过性能验证。
+        details += '；未抽样工况（未验证）：' + ', '.join(unsampled)  # 在可视报告中同样展示覆盖边界。
     page = page.replace('</html>', '<p>' + html.escape(details) + '</p><p>比较容差：rtol=1e-6，atol=1e-8。已知长度、体积、密度分别换算为 Å、Å³、Å⁻²；识别率为无量纲。未知或约化单位按各自原单位比较。</p></html>')  # 展示样本规模、环境和固定比较尺度。
     style = (  # 为本地报告添加可读布局，保留图表中的全部实测数值。
         'body{max-width:1120px;margin:36px auto;padding:0 24px;font:15px/1.7 "Segoe UI","Microsoft YaHei",sans-serif;color:#183044;background:#f6f8fb}'  # 使用系统中文字体和适度留白。
@@ -468,12 +471,20 @@ def _report(out, rows, recommendation, preflight, context=None):  # 本地自包
     (out / 'report.html').write_text(page, encoding='utf-8')  # 保存可直接离线打开的 HTML 报告。
 
 
-def main():  # 命令入口只读取明确确认的清单，并区分新运行与恢复运行。
+def _sample_jobs(cases, frames, limit):  # 可选试跑先取各组首中末，再限制全局帧数，避免多工况退化为全量串行。
+    candidates = [(case['id'], frames[case['id']][i]) for case in cases for i in sorted({0, len(frames[case['id']]) // 2, len(frames[case['id']]) - 1})]  # 每个案例生成不重复的代表帧候选。
+    if len(candidates) <= limit:  # 候选数量较小时不额外减少覆盖。
+        return candidates  # 小数据可能全部成为样本，但仍仅由显式对比模式运行。
+    indices = [len(candidates) // 2] if limit == 1 else [i * (len(candidates) - 1) // (limit - 1) for i in range(limit)]  # 均匀抽取全局候选，并在限额至少二时保留首尾。
+    return [candidates[i] for i in indices]  # 返回确定的有限样本，不宣称覆盖未抽中的工况。
+
+
+def main(argv=None):  # 默认直接正式分析；Notebook 薄入口可传入参数列表并导入本模块的 worker。
     # 命令入口只读取明确确认的清单，并区分新运行与恢复运行。
     parser = argparse.ArgumentParser(description='OVITO DXA 可验证批处理')  # 计算并保存变量 parser 的当前值。
     parser.add_argument('--config', required=True)  # 调用 parser.add_argument 完成本行所示的处理。
-    parser.add_argument('--mode', choices=['baseline', 'benchmark', 'run', 'resume'], required=True)  # 调用 parser.add_argument 完成本行所示的处理。
-    args = parser.parse_args()  # 计算并保存变量 args 的当前值。
+    parser.add_argument('--mode', choices=['baseline', 'benchmark', 'run', 'resume'], default='run', help='默认 run 直接分析；baseline/benchmark 仅显式请求时抽样试跑')  # 不自动执行单进程对照或性能搜索。
+    args = parser.parse_args(argv)  # 未传列表时读取命令行，薄入口传列表时不修改 Notebook 参数。
     config = _normalize_config(args.config)  # 计算并保存任务清单。
     resources, cases = config['resources'], config['cases']  # 计算并保存执行资源限制。
     out = Path(config['output_dir']) / ('run' if args.mode == 'resume' else args.mode)  # 计算并保存当前模式的独立输出目录。
@@ -526,7 +537,7 @@ def main():  # 命令入口只读取明确确认的清单，并区分新运行�
         out.mkdir(parents=True, exist_ok=False)  # 调用 out.mkdir 完成本行所示的处理。
         _atomic_json(out / 'manifest.json', manifest)  # 调用 _atomic_json 完成本行所示的处理。
     all_jobs = [(case['id'], frame) for case in cases for frame in frames[case['id']]]  # 建立所有案例和所选帧的一一对应任务。
-    sample_jobs = [(case['id'], frames[case['id']][i]) for case in cases for i in sorted({0, len(frames[case['id']]) // 2, len(frames[case['id']]) - 1})]  # 对每个案例选首、中、末代表帧，并对重复下标去重。
+    sample_jobs = _sample_jobs(cases, frames, resources['benchmark_max_frames']) if args.mode in ('baseline', 'benchmark') else []  # 正式运行不计算试跑样本，也不先执行单进程。
     parent_rss = psutil.Process().memory_info().rss  # 计算并保存主进程当前常驻内存。
     per_worker_estimate = 384 * 1048576 + 4096 * max(m['particle_count_first_frame'] for m in metadata.values())  # 假定每进程 384 MiB 加每首帧原子 4096 字节；这只是启动估计。
     memory_limit = available_memory * (1 - resources['reserve_memory_fraction'])  # 从当前可用内存中保留用户要求的余量。
@@ -555,7 +566,7 @@ def main():  # 命令入口只读取明确确认的清单，并区分新运行�
         best = min(valid, key=lambda r: r['elapsed_seconds']) if valid else None  # 计算并保存通过条件的最快候选配置。
         if best is not None:  # 检查本行条件，满足时执行其下的分支。
             best['recommended'] = True  # 设置或传递此项参数，供当前操作使用。
-        context = {'case_count': len(cases), 'sample_frame_count': len(sample_jobs), 'python_version': sys.version, 'ovito_version': next(iter(versions)), 'available_cpu': cpu, 'available_memory_bytes': available_memory}  # 记录候选对比的实际测试范围与运行环境。
+        context = {'case_count': len(cases), 'sample_frame_count': len(sample_jobs), 'sample_jobs': sample_jobs, 'unsampled_case_ids': [case['id'] for case in cases if case['id'] not in {cid for cid, frame in sample_jobs}], 'python_version': sys.version, 'ovito_version': next(iter(versions)), 'available_cpu': cpu, 'available_memory_bytes': available_memory}  # 明确记录实际抽样帧与未覆盖工况，不能把小样本结论扩展为全部数据最优。
         _report(out, rows, {'workers': best['workers'], 'ovito_threads': best['ovito_threads']} if best else None, preflight, context)  # 输出无需外部依赖的完整报告。
         if best is None:  # 不满足要求时拒绝执行：没有结果一致且资源合格的候选配置。
             raise RuntimeError('没有结果一致且资源合格的候选配置')  # 明确报告当前错误，避免继续产生误导性结果。
@@ -583,10 +594,12 @@ def main():  # 命令入口只读取明确确认的清单，并区分新运行�
         jobs = missing  # 计算并保存待处理帧任务。
     workers = 1 if args.mode == 'baseline' else min(resources['workers'], max(1, len(jobs)), cpu, 61 if os.name == 'nt' else cpu)  # 计算并保存并发工作进程数。
     threads = 'auto' if args.mode == 'baseline' else (resources['ovito_threads'] if workers == 1 else (1 if resources['ovito_threads'] == 'auto' else resources['ovito_threads']))  # 计算并保存每个进程的 OVITO 线程数。
+    workers = workers if jobs else 0  # 全部检查点均可复用时，不启动 DXA worker，也不记录虚构的单进程运行。
     if threads != 'auto' and workers * threads > cpu:  # 不满足要求时拒绝执行：进程数乘线程数超过可用 CPU。
         raise ValueError('进程数乘线程数超过可用 CPU')  # 明确报告当前错误，避免继续产生误导性结果。
     if jobs and parent_rss + workers * per_worker_estimate > memory_limit:  # 正式运行同样在启动前检查估计内存上限。
         raise RuntimeError('启动前保守内存估计超过可用限额：' + memory_note)  # 明确报告当前错误，避免继续产生误导性结果。
+    print(f'执行配置：{workers} 个工作进程，每进程 OVITO 线程数 {threads}；待计算 {len(jobs)} 帧，已复用 {len(retained)} 帧。' if jobs else f'本次没有待计算帧；复用了 {len(retained)} 帧，未启动 DXA 计算进程。', flush=True)  # 启动前展示实际配置，区分只核验检查点与真正计算。
     records, elapsed, peak = _run_jobs(cases, jobs, out, workers, threads, resources['chunk_size'], resources['max_pending_factor'], fingerprint) if jobs else ([], 0, 0)  # 计算并保存当前批次的帧结果。
     _verify_sources(source_stats, out, manifest)  # 调用 _verify_sources 完成本行所示的处理。
     records = retained + records  # 计算并保存当前批次的帧结果。

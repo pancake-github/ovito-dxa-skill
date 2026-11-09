@@ -1,6 +1,6 @@
 # 任务清单与命令接口
 
-辅助脚本面向 Python 3.10+，由可导入 OVITO、NumPy、psutil 的独立解释器运行。不要在 Notebook 内直接定义进程池 worker。`inspect_inputs.py` 将报告打印到标准输出；`run_dxa.py --config FILE --mode baseline|benchmark|run|resume` 读取 JSON 清单。相对路径相对于清单所在目录解析。脚本不会安装或升级依赖。
+辅助脚本面向 Python 3.10+，使用可导入 OVITO、NumPy、psutil 的 Python 环境。Notebook 入口通过 `%%writefile DXA_Multiprocessing.py` 和 `%run DXA_Multiprocessing.py` 调用可导入的 `run_dxa.main(argv=None)`，Windows 的进程池 worker 定义在 `run_dxa.py`，不要放入 Notebook 临时 `__main__`。`inspect_inputs.py` 只读检查元数据，不执行 DXA，将报告打印到标准输出；`run_dxa.py --config FILE [--mode baseline|benchmark|run|resume]` 读取 JSON 清单，省略 mode 默认为 run。相对路径相对于清单所在目录解析。脚本不会安装或升级依赖。
 
 ## 确认后的清单
 
@@ -21,16 +21,16 @@
 - `density`：`{"mode":"none"}`，或 `{"mode":"cell","confirmed":true}`。cell 表示已确认统计线长与整个盒体体积适配；含真空、局部空间选区和复杂有效体积先走专用方法，不仅扣分母。
 - `output`：`{"level":"statistics"}` 或 `{"level":"geometry"}`。geometry 添加逐线记录及 CA 文件。
 
-资源配置：`workers` 为正整数（默认 1）；`ovito_threads` 为正整数或 `"auto"`（默认 auto，采用 OVITO 内部默认线程）；`chunk_size` 默认 1；`max_pending_factor` 默认 2；`reserve_memory_fraction` 默认 0.25；`benchmark_max_workers` 默认 4。多进程候选统一从每进程 1 个 OVITO 线程开始，受帧数、可用 CPU、内存及 Windows executor 上限限制。
+资源配置：`workers` 为正整数（默认 2）；`ovito_threads` 为正整数或 `"auto"`（默认 1；auto 在单 worker 时采用 OVITO 内部默认线程，多 worker 时仍限制为每进程 1 线程）；`chunk_size` 默认 1；`max_pending_factor` 默认 2；`reserve_memory_fraction` 默认 0.25；`benchmark_max_workers` 默认 4；`benchmark_max_frames` 默认 6。默认直接以多进程配置运行，实际 worker 数受独立任务数、可用 CPU 及 Windows executor 上限限制；启动前内存估算超限会明确停止，不会自动缩减进程数后悄悄继续；独立单构型或仅有 1 个 CPU 时退为 1 个 worker，不属于额外基线。
 
 ## 输出与验收语义
 
 - run/resume 共享 `output_dir/run`；baseline 写入 `output_dir/baseline`；benchmark 写入 `output_dir/benchmark`。新的运行不覆盖已有结果；resume 只接续可验证兼容的 run。
-- baseline 和 benchmark 都抽取每组所选范围首、中、末的去重代表帧；run 执行所有已选择帧。
-- `frames.csv`：case_id、frame、timestep、time、total_line_length、cell_volume、density、density_m2、recognized_fraction、status、error 等；长度与体积保留原始单位。状态区分成功非零、成功零位错、无晶态原子以及失败；缺失数值留空，不用 0 冒充失败。
+- 默认 run 执行所有已选择帧，不自动运行 baseline 或 benchmark；仅在用户要求对照时，baseline 和 benchmark 才抽取每组所选范围首、中、末的去重候选帧，并全局均匀限额至 `benchmark_max_frames`，未抽到的工况不表示经过验证；绝不自动对全量数据先做串行基线。
+- `frames.csv`：case_id、frame、timestep、time、total_line_length、cell_volume、density、density_m2、recognized_fraction、status、error、worker_pid 等；长度与体积保留原始单位。状态区分成功非零、成功零位错、无晶态原子以及失败；缺失数值留空，不用 0 冒充失败。worker_pid 是实际计算该帧的操作系统进程号，仅用于诊断，不是持续的科学身份，也不参与结果一致性比较。
 - `families.csv` 使用 case_id、frame、family、length 长表，不将 BCC 分类写死；geometry 的逐线标识只在该帧内有效。
 - 每帧 JSON 成功原子落盘后才可作为检查点；CA 必须先完整写入。记录源文件 SHA256、帧映射、分析参数、OVITO/Python 版本及运行配置。resume 拒绝来源、科学设置或版本变化，也拒绝缺失/损坏的几何结果冒充完成。
-- benchmark 输出 JSON、CSV 及可直接打开的独立 HTML 报告，呈现完整候选耗时、峰值 RSS、相对于单进程基线的倍率、结果一致性和推荐配置。HTML 用原生 SVG/表格，无外部依赖，无 Matplotlib 或绘图插件依赖。总耗时包含导入、读取、计算、结果传输及落盘；共同预检/哈希开销单列。
+- 用户按需执行 benchmark 时，输出 JSON、CSV 及可直接打开的独立 HTML 报告，呈现完整候选耗时、峰值 RSS、相对于单进程基线的倍率、结果一致性和推荐配置。HTML 用原生 SVG/表格，无外部依赖，无 Matplotlib 或绘图插件依赖。总耗时包含导入、读取、计算、结果传输及落盘；共同预检/哈希开销单列。
 - 对照容差 rtol=1e-6、atol=1e-8；已知物理单位的长度、体积、密度分别换算为 Å、Å³、Å⁻² 后比较，无量纲比例单独比较。这样不会因使用 m 导致纳米尺度差异被绝对容差掩盖。unknown/reduced 保留原单位并记录限制。此转换仅用于验收，原始输出单位不变。不比较随机线 ID 或方向；超限不得自动放宽。仅代表帧通过数值与资源检查的候选可被推荐；全部无晶态原子不能成为合格推荐。最快的是本次样本结果，不是整条轨迹保证。
 
 实际可运行的完整清单由仓库 `tests/make_examples.py` 随合成数据生成，没有虚构文件路径。

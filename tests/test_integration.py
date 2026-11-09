@@ -71,11 +71,35 @@ class IntegrationTests(unittest.TestCase):  # 针对可观察输出进行端到�
         self.invoke(RUNNER, "--config", path, "--mode", "run", success=False)  # 未确认不能执行。
         self.assertFalse((out / "run").exists())  # 不能留下貌似成功结果。
 
+    def test_default_cli_runs_in_parallel_without_benchmark(self):  # 检查既不传执行模式也不配置资源时的真实入口。
+        payload = copy.deepcopy(self.base)  # 保持合成案例及其已确认科学设置不变。
+        payload.pop("resources", None)  # 完全省略资源字段，验证运行器自身默认值。
+        path, out = self.config("defaults", payload)  # 隔离此次测试的输入清单和输出目录。
+        self.invoke(RUNNER, "--config", path)  # 省略 --mode，直接执行真实 CLI。
+        self.assertEqual({item.name for item in out.iterdir()}, {"run"})  # 不得隐式执行 baseline 或 benchmark。
+        execution = json.loads((out / "run/execution.json").read_text(encoding="utf-8"))  # 读取真实采用的进程数及完成情况。
+        self.assertEqual((execution["workers"], execution["ovito_threads"]), (2, 1))  # 此机器资源充足时默认两个进程、每进程一个线程。
+        self.assertEqual((execution["completed"], execution["failed"]), (4, 0))  # 三帧 BCC 和一帧 FCC 都已完成。
+        rows = self.rows(out / "run/frames.csv")  # 从帧级输出验证进程号与结果状态。
+        self.assertEqual(len(rows), 4)  # 每个输入帧恰有一条统计记录。
+        self.assertTrue(all(row["status"] == "zero_dislocations" and int(row["worker_pid"]) > 0 for row in rows))  # 记录真实工作进程，零位错必须来自成功的晶体分析。
+
+    def test_default_single_frame_limits_worker_count(self):  # 单构型没有独立帧可供两个进程并行。
+        payload = json.loads((self.folder / "static.json").read_text(encoding="utf-8"))  # 使用单帧 BCC 合成构型。
+        payload.pop("resources", None)  # 不人为覆盖默认的进程配置。
+        path, out = self.config("default_static", payload)  # 使用新的测试专属目录。
+        self.invoke(RUNNER, "--config", path)  # 省略模式，走默认正式分析流程。
+        execution = json.loads((out / "run/execution.json").read_text(encoding="utf-8"))  # 获取实际缩减后的资源配置。
+        self.assertEqual((execution["workers"], execution["completed"], execution["failed"]), (1, 1, 0))  # 仅一帧时自动收窄为一个进程并成功处理。
+        self.assertEqual({item.name for item in out.iterdir()}, {"run"})  # 单构型也不能隐式触发额外试跑。
+
     def test_multicase_and_sequence_equivalence(self):  # 比较文件组织和并行方式不会改变结果。
         serial_payload = copy.deepcopy(self.base)  # 创建串行版本。
         serial_payload["resources"]["workers"] = 1  # 采用单进程参照。
         serial, serial_out = self.config("serial", serial_payload)  # 单文件多帧来源。
         self.invoke(RUNNER, "--config", serial, "--mode", "run")  # 执行全部有效帧。
+        serial_execution = json.loads((serial_out / "run/execution.json").read_text(encoding="utf-8"))  # 读取显式单进程配置的实际执行情况。
+        self.assertEqual(serial_execution["workers"], 1)  # 用户明确选择一个进程时不得强制改为默认的两个进程。
         serial_rows = self.rows(serial_out / "run/frames.csv")  # 取得实测统计。
         self.assertEqual(len(serial_rows), 4)  # 三个BCC帧加一个FCC快照。
         self.assertTrue(all(row["status"] == "zero_dislocations" for row in serial_rows))  # 完整晶体应识别为正常零位错。
@@ -132,6 +156,7 @@ class IntegrationTests(unittest.TestCase):  # 针对可观察输出进行端到�
         path, out = self.config("benchmark", payload)  # 每次使用新目录。
         self.invoke(RUNNER, "--config", path, "--mode", "benchmark")  # 执行完整计时路径。
         report = json.loads((out / "benchmark/report.json").read_text(encoding="utf-8"))  # 读取实际基准记录。
+        self.assertEqual(report["context"]["sample_frame_count"], 4)  # 该示例共有四个代表帧，不应超过默认六帧限额。
         self.assertTrue(report["recommendation"])  # 合成数据应至少有一个合格候选。
         self.assertTrue(all(row["consistent"] for row in report["candidates"]))  # 合格计算必须与基线一致。
         self.assertTrue((out / "benchmark/comparisons.csv").is_file())  # 保留可继续分析的数据表。

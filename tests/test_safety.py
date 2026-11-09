@@ -16,6 +16,26 @@ SPEC.loader.exec_module(DXA)  # 加载函数定义但不运行命令入口。
 
 
 class SafetyTests(unittest.TestCase):  # 覆盖独立审查发现的具体回归风险。
+    def test_sample_jobs_preserves_first_middle_last_for_small_selection(self):  # 候选数在上限内时不额外删去代表帧。
+        cases = [{"id": "long"}, {"id": "single"}]  # 分别覆盖长轨迹和单构型。
+        frames = {"long": list(range(100)), "single": [7]}  # 100 帧应抽取三个代表帧，单帧仅出现一次。
+        jobs = DXA._sample_jobs(cases, frames, 6)  # 按默认六帧上限选取。
+        self.assertEqual(jobs, [("long", 0), ("long", 50), ("long", 99), ("single", 7)])  # 明确验证首、中、末和单帧去重。
+        self.assertLess(len(jobs), sum(map(len, frames.values())))  # 长轨迹只取代表帧，不进行全帧试跑。
+
+    def test_sample_jobs_respects_global_limit_across_cases(self):  # 多案例时六帧是全局上限，而非每案例上限。
+        cases = [{"id": name} for name in ("a", "b", "c", "d")]  # 创建四个有独立帧序列的案例。
+        frames = {case["id"]: list(range(100)) for case in cases}  # 每个案例都有首、中、末三个候选。
+        jobs = DXA._sample_jobs(cases, frames, 6)  # 将十二个候选按全局顺序均匀限制到六个。
+        self.assertEqual(jobs, [("a", 0), ("a", 99), ("b", 50), ("c", 0), ("c", 99), ("d", 99)])  # 验证确定性选取以及候选边界。
+        self.assertEqual(len(set(jobs)), 6)  # 不重复，也不超过已确认的全局上限。
+
+    def test_sample_jobs_handles_small_candidate_set_and_one_frame_limit(self):  # 同时检查少量候选和极小采样上限。
+        cases = [{"id": "a"}, {"id": "b"}]  # 模拟两个不同来源的数据案例。
+        frames = {"a": [1, 2], "b": [4]}  # 不足三帧时不能重复选同一帧。
+        self.assertEqual(DXA._sample_jobs(cases, frames, 6), [("a", 1), ("a", 2), ("b", 4)])  # 候选数不足六时保留全部候选。
+        self.assertEqual(DXA._sample_jobs(cases, frames, 1), [("a", 2)])  # 显式上限为一时只保留全局候选中点。
+
     def test_meter_scale_mismatch_is_not_accepted(self):  # 米制纳米结构不能被绝对容差掩盖数量级差异。
         row = {"case_id": "metric", "frame": 0, "status": "success", "total_line_length": 1e-9, "cell_volume": 1e-24, "density": None, "density_m2": None, "recognized_fraction": 1.0, "families": {"test": 1e-9}, "lines": []}  # 合成非零米制记录。
         changed = copy.deepcopy(row)  # 为候选结果创建独立副本。
