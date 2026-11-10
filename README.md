@@ -1,8 +1,32 @@
-# OVITO DXA 优化指导技能
+# OVITO DXA：LAMMPS 位错分析与并行优化技能
 
-面向单组或多组 LAMMPS 数据的 DXA 位错提取与性能优化技能。技能先检查数据并确认必要的科学设置，默认逐工况处理、在工况内并行；仅在用户要求比较时对代表帧执行对照；不会假定使用者的数据按速率、取向或任何固定工况组合排列。
+使用 OVITO 的 **Dislocation Extraction Algorithm（DXA，位错提取算法）**分析 LAMMPS 构型或轨迹。这个 Codex 技能与辅助脚本帮助研究者检查输入、确认分析设置、提取位错长度和 Burgers 矢量族，并按实际机器资源组织并行计算。
 
-一组数据可以是一个静态构型，也可以是一条由一个或多个文件组成的轨迹。多个文件是否属于同一组由使用者确认。已有 DXA 脚本也可作为输入，先审查分析定义，再保留所需输出进行优化。
+**English:** An OVITO DXA skill for LAMMPS dislocation analysis and extraction: inspect molecular dynamics trajectories, calculate dislocation length and density, group Burgers vectors, and run resumable Python multiprocessing workflows in scripts or Jupyter Notebook.
+
+## 要解决什么问题？
+
+- 多帧轨迹或多组工况需要反复提取位错，逐帧重复创建流水线和重复计算会增加处理开销。
+- 直接照搬别人的晶格、原子类型或体积设置，可能改变结果的物理含义；一批文件也不一定属于同一条轨迹。
+- 固定进程数未必适合当前 CPU、内存与数据规模，计算中断后还需要知道哪些帧已完成。
+
+## 如何使用？
+
+1. [安装技能](#安装技能)，在可导入 OVITO 的 Python 环境中使用。它适用于单个 LAMMPS data 文件、多帧 dump、分帧文件、多组独立工况，也可以审查已有 DXA 脚本。
+2. 在 Codex 中调用 `$ovito-dxa` 并说明目标，例如：
+
+   > 使用 $ovito-dxa 检查我提供的 LAMMPS 轨迹，确认必要设置后统计各帧位错长度；请按我的电脑资源安排并行处理。
+
+   告知实际文件或目录后，技能先检查数据；分组、参考晶格、原子选择、单位和输出等不能可靠判断的信息会在相关阶段询问。已有脚本可一起提供，技能会先审查需要保留的分析定义。
+3. 确认任务清单后运行。默认**逐工况处理，工况内按帧多进程**，每个进程复用自己的 OVITO 流水线；进程数按资源和待处理帧数自动确定。单构型或资源受限时可能只有一个进程。Notebook 可采用 `%%writefile DXA_Multiprocessing.py` 和 `%run DXA_Multiprocessing.py`，见下方 [Notebook 入口](#notebook-入口)及[合成示例](examples/dxa_walkthrough.ipynb)。
+
+## 能得到什么？
+
+- 逐帧位错总长度、Burgers 矢量族分类长度，以及定义明确时的整盒位错密度；记录帧、模拟步、状态和分析设置。
+- CSV 统计、运行元数据与检查点；可选逐线属性和 CA 位错网络。中断后可在检查输入和设置兼容性后续算。
+- 按需对代表帧比较性能与结果一致性，报告实测耗时和内存。优化通过复用流水线、共享同一帧计算结果及并行调度减少重复工作；**实际速度和内存占用取决于数据与机器，不保证固定加速倍数**。
+
+溶质或氢相关分析需要另行确认物理定义并生成专用代码，本版不内置通用氢距离、富集或位错跨帧追踪算法。当前已验证环境与限制见 [VALIDATION.md](VALIDATION.md)。
 
 ## 内容与适用边界
 
